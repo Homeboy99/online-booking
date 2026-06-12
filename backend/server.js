@@ -321,7 +321,7 @@ app.post("/zenopay-pay", authenticateAppUser, async (req, res) => {
     const apiKey = process.env.ZENOPAY_API_KEY;
     const accountId = process.env.ZENOPAY_ACCOUNT_ID;
     const secretKey = process.env.ZENOPAY_SECRET_KEY;
-    const webhookUrl = process.env.ZENOPAY_WEBHOOK_URL;
+    const webhookUrl = String(process.env.ZENOPAY_WEBHOOK_URL || "").trim();
     const baseUrl = process.env.ZENOPAY_BASE_URL || "https://api.zeno.africa";
     const referenceField = process.env.ZENOPAY_REFERENCE_FIELD;
     const referenceMaxLen = Number.parseInt(
@@ -374,7 +374,7 @@ app.post("/zenopay-pay", authenticateAppUser, async (req, res) => {
       payload.append("secret_key", secretKey);
     }
 
-    if (webhookUrl) {
+    if (webhookUrl && !webhookUrl.includes("your-public-url")) {
       payload.append("webhook_url", webhookUrl);
     }
 
@@ -605,5 +605,5 @@ app.post("/zenopay-webhook", authenticateWebhook, async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

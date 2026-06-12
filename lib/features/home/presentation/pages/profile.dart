@@ -90,16 +90,15 @@ class _ProfilePageState extends State<ProfilePage> {
   }
 
   Future<void> _pickAvatar() async {
-    final result = await FilePicker.platform.pickFiles(
+    final result = await FilePicker.pickFile(
       type: FileType.image,
-      allowMultiple: false,
     );
 
-    if (result == null || result.files.single.path == null || !mounted) {
+    if (result == null || result.path == null || !mounted) {
       return;
     }
 
-    setState(() => _avatarPath = result.files.single.path!);
+    setState(() => _avatarPath = result.path!);
   }
 
   Future<void> _saveProfile() async {

@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: online-booking-backend
+    runtime: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_CONFIG
+        sync: false
+      - key: ZENOPAY_API_KEY
+        sync: false
+      - key: ZENOPAY_ACCOUNT_ID
+        sync: false
+      - key: ZENOPAY_SECRET_KEY
+        sync: false
+      - key: ZENOPAY_BASE_URL
+        value: https://api.zeno.africa
+      - key: ZENOPAY_WEBHOOK_URL
+        sync: false
+      - key: ZENOPAY_WEBHOOK_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false

@@ -10,10 +10,8 @@ import '../../domain/entities/app_user.dart';
 class AuthFlowHelper {
   AuthFlowHelper._();
 
-  static final GoogleSignIn _googleSignIn = GoogleSignIn(
-    scopes: const ['email'],
-    clientId: _googleClientId,
-  );
+  static final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
+  static Future<void>? _googleSignInInitialization;
 
   static String? get _googleClientId {
     final options = Firebase.app().options;
@@ -39,6 +37,8 @@ class AuthFlowHelper {
   }
 
   static Future<UserCredential?> signInWithGoogle() async {
+    await _ensureGoogleSignInInitialized();
+
     if (!kIsWeb) {
       try {
         await _googleSignIn.signOut();
@@ -47,21 +47,24 @@ class AuthFlowHelper {
       }
     }
 
-    final googleUser = await _googleSignIn.signIn();
-    if (googleUser == null) {
+    GoogleSignInAccount googleUser;
+    try {
+      googleUser = await _googleSignIn.authenticate(
+        scopeHint: const ['email'],
+      );
+    } on GoogleSignInException catch (error) {
+      if (error.code == GoogleSignInExceptionCode.canceled) {
+        return null;
+      }
+      rethrow;
+    }
+
+    final googleAuth = googleUser.authentication;
+    if (googleAuth.idToken == null) {
       return null;
     }
 
-    final googleAuth = await googleUser.authentication;
-    if (googleAuth.accessToken == null && googleAuth.idToken == null) {
-      throw FirebaseAuthException(
-        code: 'missing-google-auth-token',
-        message: 'Google Sign-In did not return authentication tokens.',
-      );
-    }
-
     final credential = GoogleAuthProvider.credential(
-      accessToken: googleAuth.accessToken,
       idToken: googleAuth.idToken,
     );
 
@@ -74,6 +77,12 @@ class AuthFlowHelper {
     }
 
     return userCredential;
+  }
+
+  static Future<void> _ensureGoogleSignInInitialized() {
+    return _googleSignInInitialization ??= _googleSignIn.initialize(
+      clientId: _googleClientId,
+    );
   }
 
   static Future<void> createUserProfileIfNeeded(
@@ -113,6 +122,7 @@ class AuthFlowHelper {
       await FirebaseAuth.instance.signOut();
     } finally {
       try {
+        await _ensureGoogleSignInInitialized();
         await _googleSignIn.signOut();
       } catch (_) {
         // Ignore Google sign-out failures so Firebase logout still succeeds.
@@ -166,6 +176,22 @@ class AuthFlowHelper {
       return firebaseErrorMessage(error, isGoogleFlow: true);
     }
 
+    if (error is GoogleSignInException) {
+      switch (error.code) {
+        case GoogleSignInExceptionCode.canceled:
+        case GoogleSignInExceptionCode.interrupted:
+          return 'Google sign-in was cancelled.';
+        case GoogleSignInExceptionCode.clientConfigurationError:
+        case GoogleSignInExceptionCode.providerConfigurationError:
+          return 'Google sign-in is not configured for this Android build yet. Add this app signing SHA to Firebase, then download the updated google-services.json.';
+        case GoogleSignInExceptionCode.uiUnavailable:
+          return 'Google sign-in is unavailable right now. Please try again.';
+        default:
+          return error.description ??
+              'Google sign-in failed. Please try again.';
+      }
+    }
+
     if (error is PlatformException) {
       final details = '${error.code} ${error.message ?? ''}'.toLowerCase();
       if (details.contains('apiexception: 10') ||
@@ -174,11 +200,11 @@ class AuthFlowHelper {
       }
 
       switch (error.code) {
-        case GoogleSignIn.kSignInCanceledError:
+        case 'sign_in_canceled':
           return 'Google sign-in was cancelled.';
-        case GoogleSignIn.kNetworkError:
+        case 'network_error':
           return 'Network error while contacting Google. Try again.';
-        case GoogleSignIn.kSignInFailedError:
+        case 'sign_in_failed':
           return 'Google sign-in failed. Check your Google/Firebase setup and try again.';
         default:
           return error.message ?? 'Google sign-in failed. Please try again.';

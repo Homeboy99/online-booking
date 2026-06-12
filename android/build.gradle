@@ -6,12 +6,14 @@ allprojects {
 }
 
 rootProject.buildDir = "../build"
+
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
-    afterEvaluate {
-        if (it.plugins.hasPlugin('com.android.library')) {
-            it.android {
-                compileSdkVersion 34
+
+    afterEvaluate { project ->
+        if (project.plugins.hasPlugin("com.android.library")) {
+            project.android {
+                compileSdkVersion 36
             }
         }
     }

@@ -460,7 +460,7 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 
-  Widget _buildSocialButton(IconData icon, Color color) {
+  Widget _buildSocialButton(FaIconData icon, Color color) {
     return Container(
       height: 64,
       width: 64,
