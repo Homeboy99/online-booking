@@ -6,24 +6,52 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
-// 🔑 Initialize Firebase Admin
-// You need to provide a service account key file
-// const serviceAccount = require("./path-to-your-service-account-key.json");
-// admin.initializeApp({
-//   credential: admin.credential.cert(serviceAccount)
-// });
+function parseFirebaseServiceAccount() {
+  const encoded = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
+  const raw = encoded
+    ? Buffer.from(encoded, "base64").toString("utf8")
+    : String(process.env.FIREBASE_CONFIG || "").trim();
 
-// Or if using environment variables:
-if (process.env.FIREBASE_CONFIG) {
+  if (!raw) return null;
+
+  try {
+    const serviceAccount = JSON.parse(raw);
+    if (typeof serviceAccount.private_key === "string") {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    }
+    return serviceAccount;
+  } catch (error) {
+    throw new Error(
+      "Firebase service account env var is not valid JSON. Set FIREBASE_SERVICE_ACCOUNT_BASE64 or FIREBASE_CONFIG."
+    );
+  }
+}
+
+const serviceAccount = parseFirebaseServiceAccount();
+if (serviceAccount) {
+  if (
+    serviceAccount.type !== "service_account" ||
+    typeof serviceAccount.project_id !== "string" ||
+    typeof serviceAccount.client_email !== "string" ||
+    typeof serviceAccount.private_key !== "string"
+  ) {
+    throw new Error(
+      "Firebase service account is incomplete. It must include type, project_id, client_email, and private_key."
+    );
+  }
+
   admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_CONFIG))
+    credential: admin.credential.cert(serviceAccount),
   });
+} else if (process.env.NODE_ENV === "production") {
+  throw new Error(
+    "Missing Firebase service account. Set FIREBASE_SERVICE_ACCOUNT_BASE64 or FIREBASE_CONFIG in Render."
+  );
 } else {
-  // Fallback for development (if already signed in via CLI)
   try {
     admin.initializeApp();
-  } catch (e) {
-    console.log("Firebase Admin already initialized or missing config");
+  } catch (error) {
+    console.log("Firebase Admin already initialized or missing local config");
   }
 }
 
