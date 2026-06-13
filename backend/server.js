@@ -7,6 +7,19 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 function parseFirebaseServiceAccount() {
+  const projectId = String(process.env.FIREBASE_PROJECT_ID || "").trim();
+  const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || "").trim();
+  const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || "").trim();
+
+  if (projectId || clientEmail || privateKey) {
+    return {
+      type: "service_account",
+      project_id: projectId,
+      client_email: clientEmail,
+      private_key: privateKey.replace(/\\n/g, "\n"),
+    };
+  }
+
   const encoded = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
   const raw = encoded
     ? Buffer.from(encoded, "base64").toString("utf8")
@@ -22,7 +35,7 @@ function parseFirebaseServiceAccount() {
     return serviceAccount;
   } catch (error) {
     throw new Error(
-      "Firebase service account env var is not valid JSON. Set FIREBASE_SERVICE_ACCOUNT_BASE64 or FIREBASE_CONFIG."
+      "Firebase service account env var is not valid JSON. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY, or set FIREBASE_SERVICE_ACCOUNT_BASE64."
     );
   }
 }
@@ -36,7 +49,7 @@ if (serviceAccount) {
     typeof serviceAccount.private_key !== "string"
   ) {
     throw new Error(
-      "Firebase service account is incomplete. It must include type, project_id, client_email, and private_key."
+      "Firebase service account is incomplete. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY from the Firebase service account JSON."
     );
   }
 
@@ -45,7 +58,7 @@ if (serviceAccount) {
   });
 } else if (process.env.NODE_ENV === "production") {
   throw new Error(
-    "Missing Firebase service account. Set FIREBASE_SERVICE_ACCOUNT_BASE64 or FIREBASE_CONFIG in Render."
+    "Missing Firebase service account. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY in Render."
   );
 } else {
   try {
