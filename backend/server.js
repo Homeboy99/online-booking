@@ -259,6 +259,98 @@ app.get("/api/payments/status/:orderId", authenticateAppUser, async (req, res) =
   }
 });
 
+/**
+ * Compatibility endpoint used by legacy/mobile `PaymentService` code.
+ * Accepts Zenopay-style payloads and proxies the create-order call to ZenoPay,
+ * then persists a lightweight payments record (merge) and returns the gateway response.
+ */
+app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
+  const body = req.body || {};
+
+  const amount = String(body.amount || body.amount_text || '');
+  const phone = String(body.buyer_phone || body.buyerPhone || body.phone || '');
+  const appOrderId = String(body.app_order_id || body.orderId || body.order_id || `ZEN-${Date.now()}`);
+  const buyerEmail = String(body.buyer_email || body.email || req.user?.email || 'customer@example.com');
+  const buyerName = String(body.buyer_name || body.name || req.user?.name || 'App Customer');
+
+  if (!amount || !phone) {
+    return res.status(400).json({ status: 'error', message: 'Missing amount or phone' });
+  }
+
+  try {
+    const payload = new URLSearchParams({
+      create_order: '1',
+      buyer_email: buyerEmail,
+      buyer_name: buyerName,
+      buyer_phone: phone,
+      amount: amount,
+      account_id: ZENOPAY_ACCOUNT_ID,
+    });
+
+    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'x-api-key': ZENOPAY_API_KEY,
+      },
+    });
+
+    const data = response.data || {};
+    const zenoOrderId = data.order_id || data.zenoOrderId || appOrderId;
+
+    // Persist/merge a payments doc so other listeners can pick up the order.
+    try {
+      await db.collection('payments').doc(appOrderId).set({
+        userId: req.user?.uid,
+        orderId: appOrderId,
+        zenoOrderId,
+        amount: Number(amount),
+        phone,
+        status: 'pending',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (e) {
+      console.error('🔥 Firestore merge error (zenopay-pay):', e);
+    }
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Payment initiated',
+      orderId: appOrderId,
+      zenoOrderId,
+      raw: data,
+    });
+  } catch (error) {
+    console.error('❌ ZenoPay proxy error (/zenopay-pay):', error.response?.data || error.message || error);
+    return res.status(500).json({ status: 'error', message: 'Failed to contact ZenoPay gateway' });
+  }
+});
+
+/**
+ * Compatibility polling endpoint for PaymentService which expects `/zenopay-status/:orderId`.
+ */
+app.get('/zenopay-status/:orderId', authenticateAppUser, async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    const orderRef = db.collection('payments').doc(orderId);
+    const doc = await orderRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ status: 'error', message: 'Order records not found' });
+    }
+
+    let currentStatus = doc.data().status;
+    if (currentStatus === 'pending') {
+      currentStatus = await checkZenoPayStatusAndUpdate(doc);
+    }
+
+    return res.status(200).json({ status: 'success', orderId: orderId, paymentStatus: currentStatus });
+  } catch (error) {
+    console.error('❌ /zenopay-status fetch error:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to resolve payment status' });
+  }
+});
+
 // Lightweight health endpoint for uptime/health checks (Render uses this path)
 app.get('/', (req, res) => {
   return res.status(200).json({
