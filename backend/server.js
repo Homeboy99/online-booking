@@ -8,60 +8,35 @@ const axios = require("axios"); // Handles outbound ZenoPay API requests
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
+/**
+ * Parses the single-line Firebase Service Account JSON string from Render
+ */
 function parseFirebaseServiceAccount() {
-  const projectId = String(process.env.FIREBASE_PROJECT_ID || "").trim();
-  const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || "").trim();
-  const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || "").trim();
-
-  if (projectId || clientEmail || privateKey) {
-    return {
-      type: "service_account",
-      project_id: projectId,
-      client_email: clientEmail,
-      private_key: privateKey.replace(/\\n/g, "\n"),
-    };
-  }
-
-  const encoded = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
-  const raw = encoded
-    ? Buffer.from(encoded, "base64").toString("utf8")
-    : String(process.env.FIREBASE_CONFIG || "").trim();
-
-  if (!raw) return null;
+  const rawJsonString = String(process.env.FIREBASE_CONFIG || "").trim();
+  if (!rawJsonString) return null;
 
   try {
-    const serviceAccount = JSON.parse(raw);
-    if (typeof serviceAccount.private_key === "string") {
-      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    const parsed = JSON.parse(rawJsonString);
+    if (typeof parsed.private_key === "string") {
+      // Replaces literal escaped newlines with actual newline characters
+      parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
     }
-    return serviceAccount;
-  } catch (error) {
-    throw new Error(
-      "Firebase service account env var is not valid JSON. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY, or set FIREBASE_SERVICE_ACCOUNT_BASE64."
-    );
+    return parsed;
+  } catch (e) {
+    console.error("❌ Failed to parse unified FIREBASE_CONFIG JSON string.");
+    return null;
   }
 }
 
+// Initialize Firebase Admin SDK
 const serviceAccount = parseFirebaseServiceAccount();
-if (serviceAccount) {
-  if (
-    serviceAccount.type !== "service_account" ||
-    typeof serviceAccount.project_id !== "string" ||
-    typeof serviceAccount.client_email !== "string" ||
-    typeof serviceAccount.private_key !== "string"
-  ) {
-    throw new Error(
-      "Firebase service account is incomplete. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY from the Firebase service account JSON."
-    );
-  }
 
+if (serviceAccount && serviceAccount.type === "service_account") {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 } else if (process.env.NODE_ENV === "production") {
-  throw new Error(
-    "Missing Firebase service account. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY in Render."
-  );
+  throw new Error("Missing or invalid Firebase service account configuration string in Render.");
 } else {
   try {
     admin.initializeApp();
@@ -115,6 +90,9 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+/**
+ * Authenticates users requesting endpoints using Firebase Auth ID Tokens
+ */
 async function authenticateAppUser(req, res, next) {
   const authHeader = String(req.get("authorization") || "").trim();
   const match = authHeader.match(/^Bearer\s+(.+)$/i);
@@ -127,7 +105,7 @@ async function authenticateAppUser(req, res, next) {
   }
 
   try {
-    // Fixed: Now correctly references match[1] to isolate token string
+    // Fixed: Correctly passes match[1] to get the pure token string split out by regex
     req.user = await admin.auth().verifyIdToken(match[1]);
     next();
   } catch (error) {
