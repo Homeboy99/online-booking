@@ -91,7 +91,8 @@ class PaymentService {
     }
 
     try {
-      final idToken = await user.getIdToken();
+      // Force a fresh ID token to avoid using an expired token
+      final idToken = await user.getIdToken(true);
       if (idToken == null || idToken.isEmpty) {
         return PaymentInitResult(
           status: PaymentInitStatus.failed,
@@ -246,7 +247,8 @@ class PaymentService {
         return;
       }
 
-      final idToken = await user.getIdToken();
+      // Force refresh the ID token before contacting backend
+      final idToken = await user.getIdToken(true);
       if (idToken == null || idToken.isEmpty) {
         debugPrint('💥 ZENOPAY STATUS SYNC ERROR: Missing auth token.');
         return;
