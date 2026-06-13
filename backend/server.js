@@ -259,6 +259,15 @@ app.get("/api/payments/status/:orderId", authenticateAppUser, async (req, res) =
   }
 });
 
+// Lightweight health endpoint for uptime/health checks (Render uses this path)
+app.get('/', (req, res) => {
+  return res.status(200).json({
+    status: 'ok',
+    service: 'online-booking-backend',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Port Execution Configuration
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
