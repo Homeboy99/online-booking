@@ -162,8 +162,8 @@ class PaymentService {
 
       return result;
     } on DioException catch (e) {
-      final String? message = _extractBackendErrorMessage(
-          e, resolvedBackendBaseUrl);
+      final String? message =
+          _extractBackendErrorMessage(e, resolvedBackendBaseUrl);
       debugPrint("💥 ZENOPAY ERROR: $message");
       await _updateTransactionStatus(orderId, 'error');
       return PaymentInitResult(

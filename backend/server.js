@@ -108,8 +108,12 @@ async function authenticateAppUser(req, res, next) {
   }
 
   try {
-    // Fixed: Correctly passes match to get the pure token string split out by regex
-    req.user = await admin.auth().verifyIdToken(match);
+    // Extract the actual token string from the regex capture group
+    const idToken = String(match[1] || "").trim();
+    if (!idToken) {
+      return res.status(401).json({ status: "failed", message: "Missing Firebase auth token" });
+    }
+    req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (error) {
     console.error("❌ Auth Verification Error:", error);
@@ -351,6 +355,49 @@ app.get('/zenopay-status/:orderId', authenticateAppUser, async (req, res) => {
   }
 });
 
+/**
+ * Temporary debug endpoint (local-only) to directly call ZenoPay without Firebase auth.
+ * Usage: GET /_debug/zenopay?phone=2557XXXXXXX&amount=45000
+ * NOTE: Disabled in production for safety.
+ */
+app.get('/_debug/zenopay', async (req, res) => {
+  if (isProduction) {
+    return res.status(403).json({ status: 'error', message: 'Debug endpoint disabled in production' });
+  }
+
+  const phone = String(req.query.phone || req.query.buyer_phone || '').trim();
+  const amount = String(req.query.amount || req.query.amt || '').trim();
+
+  if (!phone || !amount) {
+    return res.status(400).json({ status: 'error', message: 'Provide phone and amount query params' });
+  }
+
+  try {
+    const payload = new URLSearchParams({
+      create_order: '1',
+      buyer_phone: phone,
+      amount: amount,
+      account_id: ZENOPAY_ACCOUNT_ID,
+      buyer_email: 'debug@example.com',
+      buyer_name: 'Debug User',
+    });
+
+    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'x-api-key': ZENOPAY_API_KEY,
+      },
+      timeout: 15000,
+    });
+
+    console.log('[_debug/zenopay] response:', response.data);
+    return res.status(200).json({ status: 'success', raw: response.data });
+  } catch (err) {
+    console.error('[_debug/zenopay] error:', err.response?.data || err.message || err);
+    return res.status(500).json({ status: 'error', message: err.response?.data || err.message || 'gateway error' });
+  }
+});
+
 // Lightweight health endpoint for uptime/health checks (Render uses this path)
 app.get('/', (req, res) => {
   return res.status(200).json({
@@ -362,6 +409,8 @@ app.get('/', (req, res) => {
 
 // Port Execution Configuration
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running smoothly on port ${PORT}`);
+// Bind host explicitly so devices on the LAN can reach the server during local testing
+const HOST = process.env.HOST || "0.0.0.0";
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 Server running smoothly on ${HOST}:${PORT}`);
 });
