@@ -9,21 +9,24 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 /**
- * Parses the single-line Firebase Service Account JSON string from Render
+ * Decodes and parses the bulletproof Base64 Service Account string from Render
  */
 function parseFirebaseServiceAccount() {
-  const rawJsonString = String(process.env.FIREBASE_CONFIG || "").trim();
-  if (!rawJsonString) return null;
+  const encoded = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
+  if (!encoded) return null;
 
   try {
-    const parsed = JSON.parse(rawJsonString);
+    // Safely convert the base64 string back into readable JSON
+    const raw = Buffer.from(encoded, "base64").toString("utf8");
+    const parsed = JSON.parse(raw);
+
     if (typeof parsed.private_key === "string") {
       // Replaces literal escaped newlines with actual newline characters
       parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
     }
     return parsed;
   } catch (e) {
-    console.error("❌ Failed to parse unified FIREBASE_CONFIG JSON string.");
+    console.error("❌ Failed to parse base64 service account string.");
     return null;
   }
 }
@@ -36,7 +39,7 @@ if (serviceAccount && serviceAccount.type === "service_account") {
     credential: admin.credential.cert(serviceAccount),
   });
 } else if (process.env.NODE_ENV === "production") {
-  throw new Error("Missing or invalid Firebase service account configuration string in Render.");
+  throw new Error("Missing or invalid FIREBASE_SERVICE_ACCOUNT_BASE64 string in Render.");
 } else {
   try {
     admin.initializeApp();
@@ -105,8 +108,8 @@ async function authenticateAppUser(req, res, next) {
   }
 
   try {
-    // Fixed: Correctly passes match[1] to get the pure token string split out by regex
-    req.user = await admin.auth().verifyIdToken(match[1]);
+    // Fixed: Correctly passes match to get the pure token string split out by regex
+    req.user = await admin.auth().verifyIdToken(match);
     next();
   } catch (error) {
     console.error("❌ Auth Verification Error:", error);
