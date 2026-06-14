@@ -181,19 +181,21 @@ class _PaymentPageState extends State<PaymentPage> {
 
     try {
       // Reserve seats on the server before initiating payment
-      final bool reserved = await _paymentService.reserveSeats(
+      final Map<String, dynamic> reserveResp = await _paymentService.reserveSeats(
         orderId: orderId,
         busId: widget.bus.id,
         travelDate: widget.travelDate,
         seats: widget.selectedSeats,
       );
 
+      final bool reserved = reserveResp['success'] == true;
       if (!reserved) {
+        final String message = reserveResp['message']?.toString() ?? 'Selected seats are no longer available.';
         if (mounted) {
           setState(() => _isProcessing = false);
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Selected seats are no longer available.'),
+            SnackBar(
+              content: Text(message),
               backgroundColor: AppColors.error,
               behavior: SnackBarBehavior.floating,
             ),

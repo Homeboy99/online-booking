@@ -386,7 +386,7 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
         duration: const Duration(milliseconds: 300),
         decoration: BoxDecoration(
           color: isBooked
-              ? Colors.grey.shade200
+              ? const Color(0xFFF3E8FF) // light purple background for booked
               : (isSelected
                   ? AppColors.primary
                   : (isVVIP
@@ -395,7 +395,7 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
           borderRadius: BorderRadius.circular(15),
           border: Border.all(
             color: isBooked
-                ? Colors.grey
+                ? const Color(0xFF8A2BE2) // purple border for booked
                 : (isSelected
                     ? AppColors.primary
                     : (isVVIP ? const Color(0xFFFFD700) : Colors.black12)),
@@ -412,7 +412,7 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
                 Icon(
                   isVVIP ? Icons.airline_seat_flat_rounded : Icons.chair_rounded,
                   color: isBooked
-                      ? Colors.grey
+                      ? const Color(0xFF6A0DAD)
                       : (isSelected
                           ? Colors.white
                           : (isVVIP
@@ -425,7 +425,7 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
                   isVVIP ? "V$seatNum" : seatNum.toString(),
                   style: TextStyle(
                     color: isBooked
-                        ? Colors.grey
+                        ? const Color(0xFF6A0DAD)
                         : (isSelected
                             ? Colors.white
                             : (isVVIP
@@ -478,7 +478,7 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
                 child: Text(
                   'BOOKED',
                   style: TextStyle(
-                    color: Colors.grey.shade700,
+                    color: const Color(0xFF6A0DAD),
                     fontSize: 9,
                     fontWeight: FontWeight.w900,
                   ),

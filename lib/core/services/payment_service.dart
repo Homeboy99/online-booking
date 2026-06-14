@@ -187,20 +187,29 @@ class PaymentService {
   }
 
   /// Reserve seats via backend before initiating payment
-  Future<bool> reserveSeats({
+  /// Reserve seats via backend before initiating payment.
+  /// Returns a map: { 'success': bool, 'message': String?, 'reservedUntil': String? }
+  Future<Map<String, dynamic>> reserveSeats({
     required String orderId,
     required String busId,
     required DateTime travelDate,
     required List<String> seats,
   }) async {
-    if (backendBaseUrl.isEmpty) return false;
+    if (backendBaseUrl.isEmpty) {
+      return {'success': false, 'message': 'Payment backend not configured.'};
+    }
     final user = _auth.currentUser;
-    if (user == null) return false;
+    if (user == null) {
+      return {'success': false, 'message': 'Please sign in before reserving seats.'};
+    }
 
     try {
       final String? idToken = await user.getIdToken(true);
       await _logIdTokenInfo(idToken, tag: 'reserveSeats');
-      if (idToken == null || idToken.isEmpty) return false;
+      if (idToken == null || idToken.isEmpty) {
+        return {'success': false, 'message': 'Authentication required.'};
+      }
+
       final resp = await _dio.post(
         '$backendBaseUrl/api/reserve-seats',
         data: {
@@ -211,14 +220,35 @@ class PaymentService {
         },
         options: Options(headers: {'Authorization': 'Bearer $idToken'}),
       );
+
       final data = resp.data;
-      if (data is Map && (data['status'] == 'success' || data['status'] == 'ok')) {
-        return true;
+      if (data is Map) {
+        final status = (data['status'] ?? '').toString().toLowerCase();
+        final msg = data['message']?.toString() ?? '';
+        if (status == 'success' || status == 'ok') {
+          return {
+            'success': true,
+            'message': msg.isNotEmpty ? msg : 'Seats reserved',
+            'reservedUntil': data['reservedUntil']?.toString(),
+          };
+        }
+        return {'success': false, 'message': msg.isNotEmpty ? msg : 'Seat reservation failed'};
       }
-      return false;
+
+      return {'success': false, 'message': 'Unexpected response from reservation endpoint.'};
+    } on DioException catch (e) {
+      String msg = 'Failed to reserve seats';
+      try {
+        final d = e.response?.data;
+        if (d is Map) msg = d['message']?.toString() ?? d.toString();
+        else if (d is String) msg = d;
+        else msg = e.message ?? msg;
+      } catch (_) {}
+      debugPrint('🔥 reserveSeats failed: $msg');
+      return {'success': false, 'message': msg};
     } catch (e) {
       debugPrint('🔥 reserveSeats failed: $e');
-      return false;
+      return {'success': false, 'message': e.toString()};
     }
   }
 
