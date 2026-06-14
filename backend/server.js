@@ -187,11 +187,15 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
+      // IMPORTANT: creation of a ZenoPay order does not mean the payment
+      // has been completed. Return a pending payment status so the client
+      // waits for a webhook/callback or polling to mark the payment completed.
       return res.status(200).json({
-        status: "success",
-        message: "Payment initiated",
+        status: "pending",
+        message: data.message || "Request in progress. You will receive a callback shortly",
         orderId: orderId,
-        zenoOrderId: zenoOrderId
+        zenoOrderId: zenoOrderId,
+        raw: data,
       });
     }
 
@@ -334,9 +338,10 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
       console.error('🔥 Firestore merge error (zenopay-pay):', e);
     }
 
+    // Creation accepted — it's still a pending payment until ZenoPay confirms
     return res.status(200).json({
-      status: 'success',
-      message: 'Payment initiated',
+      status: 'pending',
+      message: data.message || 'Request in progress. You will receive a callback shortly',
       orderId: appOrderId,
       zenoOrderId,
       raw: data,
@@ -408,7 +413,11 @@ app.get('/_debug/zenopay', async (req, res) => {
     });
 
     console.log('[_debug/zenopay] response:', response.data);
-    return res.status(200).json({ status: 'success', raw: response.data });
+    return res.status(200).json({
+      status: 'pending',
+      message: response.data?.message || 'Request in progress. You will receive a callback shortly',
+      raw: response.data,
+    });
   } catch (err) {
     console.error('[_debug/zenopay] error:', err.response?.data || err.message || err);
     return res.status(500).json({ status: 'error', message: err.response?.data || err.message || 'gateway error' });
