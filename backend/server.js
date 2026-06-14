@@ -151,6 +151,7 @@ app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
       }
     });
 
+    console.log(`[reserve-seats] reserved ${seats.length} seats for order=${orderId} bus=${busId} date=${isoDate} until=${reservedUntil.toISOString()}`);
     return res.status(200).json({ status: 'success', message: 'Seats reserved', reservedUntil: reservedUntil.toISOString() });
   } catch (err) {
     console.error('❌ Seat reservation error:', err.message || err);
@@ -461,6 +462,8 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
     });
 
     const data = response.data || {};
+    console.log('[zenopay-pay] request payload:', payload.toString());
+    console.log('[zenopay-pay] gateway response:', JSON.stringify(data));
     const zenoOrderId = data.order_id || data.zenoOrderId || appOrderId;
 
     // Persist/merge a payments doc so other listeners can pick up the order.
@@ -480,6 +483,7 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
     }
 
     // Creation accepted — it's still a pending payment until ZenoPay confirms
+    console.log(`[zenopay-pay] persisted payment doc for order=${appOrderId} zenoOrderId=${zenoOrderId}`);
     return res.status(200).json({
       status: 'pending',
       message: data.message || 'Request in progress. You will receive a callback shortly',
