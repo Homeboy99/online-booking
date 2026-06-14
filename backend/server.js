@@ -221,6 +221,10 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
     zenoPayload.append('account_id', ZENOPAY_ACCOUNT_ID);
     zenoPayload.append('amount', String(amount));
     zenoPayload.append('chat_id', formattedPhone);
+    // Compatibility / legacy fields some gateways expect
+    zenoPayload.append('buyer_phone', formattedPhone);
+    zenoPayload.append('buyer_email', req.user?.email || 'customer@example.com');
+    zenoPayload.append('buyer_name', req.user?.name || req.user?.displayName || 'App Customer');
     zenoPayload.append('status', 'payment');
 
     console.log(`[ZenoPay] Initializing payment for order ${orderId}, phone ${formattedPhone}, amount ${amount}`);
@@ -229,6 +233,7 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-api-key': ZENOPAY_API_KEY },
       timeout: 15000
     });
+    console.log('[ZenoPay] gateway response:', zenoResponse.status, JSON.stringify(zenoResponse.data));
 
     const zenoOrderId = zenoResponse.data?.order_id;
     if (!zenoOrderId) {
