@@ -3,7 +3,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const admin = require("firebase-admin");
 const path = require("path");
-const axios = require("axios"); // Handles outbound ZenoPay API requests
+const axios = require("axios");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
@@ -16,12 +16,9 @@ function parseFirebaseServiceAccount() {
   if (!encoded) return null;
 
   try {
-    // Safely convert the base64 string back into readable JSON
     const raw = Buffer.from(encoded, "base64").toString("utf8");
     const parsed = JSON.parse(raw);
-
     if (typeof parsed.private_key === "string") {
-      // Replaces literal escaped newlines with actual newline characters
       parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
     }
     return parsed;
@@ -55,11 +52,10 @@ const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
   .map((value) => value.trim())
   .filter(Boolean);
 
-// ZenoPay Configurations pulled from Render
+// ZenoPay Configurations pulled from environment
 const ZENOPAY_API_KEY = String(process.env.ZENOPAY_API_KEY || "").trim();
 const ZENOPAY_ACCOUNT_ID = String(process.env.ZENOPAY_ACCOUNT_ID || "").trim();
-const ZENOPAY_SECRET_KEY = String(process.env.ZENOPAY_SECRET_KEY || "").trim();
-const ZENOPAY_WEBHOOK_SECRET = String(process.env.ZENOPAY_WEBHOOK_SECRET || "").trim();
+// ZENOPAY_WEBHOOK_SECRET is optional – not required for polling
 
 // Payment polling configuration
 const PAYMENT_POLL_TTL_SECONDS = Number(process.env.PAYMENT_POLL_TTL_SECONDS || 900); // 15 minutes default
@@ -114,7 +110,6 @@ app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
   }
 
   try {
-    // Normalize date to yyyy-mm-dd
     const date = new Date(travelDate);
     if (isNaN(date.getTime())) {
       return res.status(400).json({ status: 'error', message: 'Invalid travelDate' });
@@ -125,7 +120,6 @@ app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
     const seatRefs = seats.map(seat => db.collection('seat_reservations').doc(`${busId}_${isoDate}_${seat}`));
 
     await db.runTransaction(async (tx) => {
-      // Validate availability
       for (let i = 0; i < seatRefs.length; i++) {
         const snap = await tx.get(seatRefs[i]);
         if (snap.exists) {
@@ -141,7 +135,6 @@ app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
         }
       }
 
-      // Reserve seats
       for (let i = 0; i < seatRefs.length; i++) {
         tx.set(seatRefs[i], {
           busId,
@@ -165,7 +158,6 @@ app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
   }
 });
 
-
 /**
  * Authenticates users requesting endpoints using Firebase Auth ID Tokens
  */
@@ -181,26 +173,9 @@ async function authenticateAppUser(req, res, next) {
   }
 
   try {
-    // Extract the actual token string from the regex capture group
     const idToken = String(match[1] || "").trim();
     if (!idToken) {
       return res.status(401).json({ status: "failed", message: "Missing Firebase auth token" });
-    }
-
-    // Debug: decode token payload (without verification) to inspect iat/exp
-    try {
-      const parts = idToken.split('.');
-      if (parts.length === 3) {
-        const payloadJson = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-        const payload = JSON.parse(payloadJson);
-        const iat = payload.iat;
-        const exp = payload.exp;
-        console.log(`🔐 ID token debug: iat=${new Date(iat * 1000).toISOString()} exp=${new Date(exp * 1000).toISOString()} now=${new Date().toISOString()}`);
-      } else {
-        console.log('🔐 ID token debug: unexpected token format');
-      }
-    } catch (dbgErr) {
-      console.log('🔐 ID token debug parse failed:', dbgErr.message);
     }
 
     req.user = await admin.auth().verifyIdToken(idToken);
@@ -214,191 +189,151 @@ async function authenticateAppUser(req, res, next) {
   }
 }
 
-// ------------------- ZENO PAY INTERFACES -------------------
+// ------------------- FIXED ZENO PAY INTERFACES -------------------
 
 /**
- * Endpoint to initiate payment tracking records and contact ZenoPay gateway
+ * Endpoint to initiate payment with ZenoPay using the correct API.
+ * Expects: { amount, phone, orderId, busId, travelDate, seats }
  */
 app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
-  const { amount, phone, orderId } = req.body;
+  const { amount, phone, orderId, busId, travelDate, seats } = req.body;
 
-  if (!amount || !phone || !orderId) {
-    return res.status(400).json({ status: "error", message: "Missing amount, phone, or orderId" });
+  if (!amount || !phone || !orderId || !busId || !travelDate || !Array.isArray(seats) || seats.length === 0) {
+    return res.status(400).json({ status: "error", message: "Missing required booking details" });
   }
 
   try {
-    const payload = new URLSearchParams({
-      create_order: "1",
-      buyer_email: req.user.email || "customer@example.com",
-      buyer_name: req.user.name || "App Customer",
-      buyer_phone: phone,
-      amount: amount,
-      account_id: ZENOPAY_ACCOUNT_ID
-    });
-
-    const response = await axios.post("https://zenoapi.com", payload.toString(), {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "x-api-key": ZENOPAY_API_KEY
-      }
-    });
-
-    const data = response.data;
-
-    if (data.status === "success" || data.order_id) {
-      const zenoOrderId = data.order_id || orderId;
-
-      // Track local ledger item marked pending initially
-      const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
-      await db.collection("payments").doc(orderId).set({
-        userId: req.user.uid,
-        orderId: orderId,
-        zenoOrderId: zenoOrderId,
-        amount: amount,
-        phone: phone,
-        status: "pending",
-        pollAttempts: 0,
-        pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      // IMPORTANT: creation of a ZenoPay order does not mean the payment
-      // has been completed. Return a pending payment status so the client
-      // waits for a webhook/callback or polling to mark the payment completed.
-      return res.status(200).json({
-        status: "pending",
-        message: data.message || "Request in progress. You will receive a callback shortly",
-        orderId: orderId,
-        zenoOrderId: zenoOrderId,
-        raw: data,
-      });
+    // Format phone number to Tanzanian international format (255XXXXXXXXX)
+    let formattedPhone = phone.trim().replace(/^\+/, '');
+    if (formattedPhone.startsWith('0')) {
+      formattedPhone = '255' + formattedPhone.substring(1);
+    }
+    if (!formattedPhone.match(/^255[67]\d{8}$/)) {
+      return res.status(400).json({ status: "error", message: "Invalid phone number format for Tanzania" });
     }
 
-    return res.status(400).json({ status: "failed", message: data.message || "Failed to initialize ZenoPay session" });
+    // Correct ZenoPay push payload
+    const zenoPayload = new URLSearchParams();
+    zenoPayload.append('create_order', '1');
+    zenoPayload.append('api_key', ZENOPAY_API_KEY);
+    zenoPayload.append('account_id', ZENOPAY_ACCOUNT_ID);
+    zenoPayload.append('amount', String(amount));
+    zenoPayload.append('chat_id', formattedPhone);
+    zenoPayload.append('status', 'payment');
 
-  } catch (error) {
-    console.error("❌ ZenoPay Error:", error.response?.data || error.message);
-    return res.status(500).json({ status: "error", message: "Internal gateway processing failure" });
+    console.log(`[ZenoPay] Initializing payment for order ${orderId}, phone ${formattedPhone}, amount ${amount}`);
+
+    const zenoResponse = await axios.post("https://zenoapi.com/api/payments", zenoPayload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000
+    });
+
+    const zenoOrderId = zenoResponse.data?.order_id;
+    if (!zenoOrderId) {
+      throw new Error(`ZenoPay rejected: ${JSON.stringify(zenoResponse.data)}`);
+    }
+
+    // Store payment record with full booking details
+    const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
+    await db.collection("payments").doc(orderId).set({
+      userId: req.user.uid,
+      orderId: orderId,
+      zenoOrderId: zenoOrderId,
+      amount: Number(amount),
+      phone: formattedPhone,
+      busId: busId,
+      travelDate: travelDate,
+      seats: seats,
+      status: "pending",
+      pollAttempts: 0,
+      pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Start immediate polling for this order (catches failures quickly)
+    startImmediatePolling(orderId, zenoOrderId);
+
+    return res.status(200).json({
+      status: "pending",
+      message: "USSD push sent. Please check your phone and enter PIN.",
+      orderId: orderId,
+      zenoOrderId: zenoOrderId
+    });
+
+  } catch (err) {
+    console.error("❌ ZenoPay initialization error:", err.response?.data || err.message);
+    return res.status(500).json({
+      status: "failed",
+      message: "Payment gateway error. Please try again."
+    });
   }
 });
 
 /**
- * Worker Function: Queries active status from ZenoPay to reconcile pending logs
+ * Immediately poll ZenoPay for a specific order every 5 seconds (max 12 attempts = 60 seconds)
+ * to detect failures/cancellations and release seats.
  */
-async function checkZenoPayStatusAndUpdate(orderDoc) {
-  // Refresh the snapshot to ensure we act on the latest state
-  const fresh = await orderDoc.ref.get();
-  const paymentData = fresh.data();
-  if (!paymentData) return null;
+async function startImmediatePolling(orderId, zenoOrderId, attempt = 1) {
+  const MAX_ATTEMPTS = 12;   // 12 * 5s = 60 seconds
+  const DELAY_MS = 5000;
 
-  const currentStatus = (paymentData.status || '').toString().toLowerCase();
-  if (currentStatus !== 'pending') {
-    // No work to do if someone already cancelled or completed the order
-    return currentStatus;
+  if (attempt > MAX_ATTEMPTS) {
+    console.log(`[ImmediatePoll] Order ${orderId} timed out after ${MAX_ATTEMPTS} attempts.`);
+    const orderRef = db.collection("payments").doc(orderId);
+    const doc = await orderRef.get();
+    if (doc.exists && doc.data().status === 'pending') {
+      await orderRef.update({ status: 'failed', failReason: 'poll_timeout', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await updateSeatReservationsForOrder(orderId, 'cancelled');
+    }
+    return;
   }
 
-  // If we've passed the polling deadline, mark failed (timeout)
-  try {
-    const now = new Date();
-    if (paymentData.pollDeadline && paymentData.pollDeadline.toDate && paymentData.pollDeadline.toDate() < now) {
-      await fresh.ref.update({
-        status: 'failed',
-        failReason: 'poll_timeout',
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  setTimeout(async () => {
+    try {
+      // Correct status check payload
+      const checkPayload = new URLSearchParams();
+      checkPayload.append('check_order', '1');
+      checkPayload.append('api_key', ZENOPAY_API_KEY);
+      checkPayload.append('order_id', zenoOrderId);
+
+      const response = await axios.post("https://zenoapi.com/api/payments", checkPayload.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 10000
       });
-      try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after timeout failed', e); }
-      return 'failed';
-    }
-  } catch (e) {
-    console.error('❌ Poll-deadline check failed:', e.message || e);
-  }
 
-  // Query remote gateway for authoritative status
-  try {
-    const payload = new URLSearchParams({
-      check_status: "1",
-      order_id: paymentData.zenoOrderId,
-      account_id: ZENOPAY_ACCOUNT_ID
-    });
+      const remoteStatus = String(response.data?.payment_status || "").toLowerCase();
+      console.log(`[ImmediatePoll ${attempt}] Order ${orderId} status: ${remoteStatus}`);
 
-    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "x-api-key": ZENOPAY_API_KEY
-      },
-      timeout: 15000,
-    });
+      let finalStatus = null;
+      if (["success", "completed", "paid"].includes(remoteStatus)) finalStatus = "completed";
+      else if (["failed", "declined", "cancelled", "expired", "error"].includes(remoteStatus)) finalStatus = "failed";
 
-    const remoteStatus = String(response.data?.payment_status || response.data?.status || "").toLowerCase();
-    let computedStatus = 'pending';
-    if (["completed", "success", "paid"].some(s => remoteStatus.includes(s))) computedStatus = 'completed';
-    else if (["failed", "declined", "error"].some(s => remoteStatus.includes(s))) computedStatus = 'failed';
-    else if (["cancelled", "expired"].some(s => remoteStatus.includes(s))) computedStatus = 'cancelled';
-
-    // Re-fetch to make sure status wasn't changed while we queried remote
-    const latest = await orderDoc.ref.get();
-    const latestStatus = (latest.data()?.status || '').toString().toLowerCase();
-    if (latestStatus !== 'pending') return latestStatus;
-
-    // Prepare fields to update (increment attempts + timestamps)
-    const updates = {
-      lastPolledAt: admin.firestore.FieldValue.serverTimestamp(),
-      pollAttempts: admin.firestore.FieldValue.increment(1),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    if (computedStatus !== 'pending') {
-      updates.status = computedStatus;
-    }
-
-    await latest.ref.update(updates);
-
-    // If we still have a pending after incrementing attempts, check attempts/deadline to possibly fail
-    if (computedStatus === 'pending') {
-      const post = await orderDoc.ref.get();
-      const attempts = Number(post.data()?.pollAttempts || 0);
-      const deadline = post.data()?.pollDeadline;
-      if (attempts >= PAYMENT_MAX_POLL_ATTEMPTS || (deadline && deadline.toDate && deadline.toDate() < new Date())) {
-        await post.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after exhausted failed', e); }
-        return 'failed';
+      if (finalStatus) {
+        const orderRef = db.collection("payments").doc(orderId);
+        await orderRef.update({ status: finalStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        if (finalStatus === "completed") {
+          await updateSeatReservationsForOrder(orderId, 'booked');
+          console.log(`✅ Payment completed for order ${orderId}`);
+        } else {
+          await updateSeatReservationsForOrder(orderId, 'cancelled');
+          console.log(`❌ Payment failed/cancelled for order ${orderId}`);
+        }
+        return;
       }
-      return 'pending';
-    }
 
-    // If status moved to a final state, reconcile reservations
-    try {
-      if (computedStatus === 'completed') {
-        await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
-      } else if (['failed', 'cancelled'].includes(computedStatus)) {
-        await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
-      }
-    } catch (innerErr) {
-      console.error('❌ Failed to update seat reservations for order:', innerErr.message || innerErr);
+      // Still pending – continue polling
+      startImmediatePolling(orderId, zenoOrderId, attempt + 1);
+    } catch (err) {
+      console.error(`[ImmediatePoll] Error checking status for order ${orderId}:`, err.message);
+      // Retry on network error
+      startImmediatePolling(orderId, zenoOrderId, attempt + 1);
     }
-
-    return computedStatus;
-  } catch (err) {
-    console.error("Status check operation failed:", err.message || err);
-    // If status check failed, increment attempts and return current status
-    try {
-      await orderDoc.ref.update({ pollAttempts: admin.firestore.FieldValue.increment(1), lastPolledAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-      const post = await orderDoc.ref.get();
-      if (Number(post.data()?.pollAttempts || 0) >= PAYMENT_MAX_POLL_ATTEMPTS) {
-        await post.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after error exhausted failed', e); }
-        return 'failed';
-      }
-    } catch (e) {
-      console.error('❌ failed to increment pollAttempts after error:', e.message || e);
-    }
-    return paymentData.status;
-  }
+  }, DELAY_MS);
 }
 
 /**
- * Update seat reservation docs for an orderId
+ * Update seat reservation documents for a given orderId.
  * newStatus: 'booked' or 'cancelled'
  */
 async function updateSeatReservationsForOrder(orderId, newStatus) {
@@ -417,6 +352,91 @@ async function updateSeatReservationsForOrder(orderId, newStatus) {
     batch.update(doc.ref, updates);
   });
   await batch.commit();
+}
+
+/**
+ * Periodic worker: checks pending payments using the same correct API.
+ * Used as a fallback in case immediate polling missed something.
+ */
+async function checkZenoPayStatusAndUpdate(orderDoc) {
+  const fresh = await orderDoc.ref.get();
+  const paymentData = fresh.data();
+  if (!paymentData) return null;
+
+  const currentStatus = (paymentData.status || '').toString().toLowerCase();
+  if (currentStatus !== 'pending') return currentStatus;
+
+  // Check deadline
+  try {
+    const now = new Date();
+    if (paymentData.pollDeadline && paymentData.pollDeadline.toDate && paymentData.pollDeadline.toDate() < now) {
+      await fresh.ref.update({ status: 'failed', failReason: 'poll_timeout', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+      return 'failed';
+    }
+  } catch (e) { console.error('Deadline check error:', e); }
+
+  // Query ZenoPay using correct endpoint
+  try {
+    const checkPayload = new URLSearchParams();
+    checkPayload.append('check_order', '1');
+    checkPayload.append('api_key', ZENOPAY_API_KEY);
+    checkPayload.append('order_id', paymentData.zenoOrderId);
+
+    const response = await axios.post("https://zenoapi.com/api/payments", checkPayload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
+    });
+
+    const remoteStatus = String(response.data?.payment_status || "").toLowerCase();
+    let computedStatus = 'pending';
+    if (["success", "completed", "paid"].some(s => remoteStatus.includes(s))) computedStatus = 'completed';
+    else if (["failed", "declined", "error", "cancelled", "expired"].some(s => remoteStatus.includes(s))) computedStatus = 'failed';
+
+    // Re-fetch to avoid race
+    const latest = await orderDoc.ref.get();
+    if (latest.data()?.status !== 'pending') return latest.data().status;
+
+    const updates = {
+      lastPolledAt: admin.firestore.FieldValue.serverTimestamp(),
+      pollAttempts: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (computedStatus !== 'pending') updates.status = computedStatus;
+
+    await latest.ref.update(updates);
+
+    if (computedStatus !== 'pending') {
+      if (computedStatus === 'completed') {
+        await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
+      } else {
+        await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+      }
+      return computedStatus;
+    }
+
+    // If still pending, check attempts exhaustion
+    const attempts = Number(latest.data()?.pollAttempts || 0);
+    const deadline = latest.data()?.pollDeadline;
+    if (attempts >= PAYMENT_MAX_POLL_ATTEMPTS || (deadline && deadline.toDate && deadline.toDate() < new Date())) {
+      await latest.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+      return 'failed';
+    }
+    return 'pending';
+
+  } catch (err) {
+    console.error("Status check error:", err.message);
+    // Increment attempts and continue
+    await orderDoc.ref.update({ pollAttempts: admin.firestore.FieldValue.increment(1), lastPolledAt: admin.firestore.FieldValue.serverTimestamp() });
+    const post = await orderDoc.ref.get();
+    if (Number(post.data()?.pollAttempts || 0) >= PAYMENT_MAX_POLL_ATTEMPTS) {
+      await post.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+      return 'failed';
+    }
+    return paymentData.status;
+  }
 }
 
 /**
@@ -445,13 +465,7 @@ app.post('/api/cancel-order', authenticateAppUser, async (req, res) => {
       return res.status(400).json({ status: 'failed', message: resTx.message });
     }
 
-    // Update reservations
-    try {
-      await updateSeatReservationsForOrder(orderId, 'cancelled');
-    } catch (err) {
-      console.error('❌ Failed to release reservations on cancel:', err.message || err);
-    }
-
+    await updateSeatReservationsForOrder(orderId, 'cancelled');
     return res.status(200).json({ status: 'success', message: 'Order cancelled' });
   } catch (err) {
     console.error('❌ /api/cancel-order error:', err.message || err);
@@ -459,9 +473,8 @@ app.post('/api/cancel-order', authenticateAppUser, async (req, res) => {
   }
 });
 
-
 /**
- * Polling Route: Client application requests state evaluation via intervals
+ * Polling Route: Client requests status (also used by Flutter)
  */
 app.get("/api/payments/status/:orderId", authenticateAppUser, async (req, res) => {
   const { orderId } = req.params;
@@ -493,65 +506,62 @@ app.get("/api/payments/status/:orderId", authenticateAppUser, async (req, res) =
 });
 
 /**
- * Compatibility endpoint used by legacy/mobile `PaymentService` code.
- * Accepts Zenopay-style payloads and proxies the create-order call to ZenoPay,
- * then persists a lightweight payments record (merge) and returns the gateway response.
+ * Compatibility endpoint for legacy /zenopay-pay (used by some mobile clients)
+ * Uses the same corrected API.
  */
 app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
   const body = req.body || {};
-
   const amount = String(body.amount || body.amount_text || '');
   const phone = String(body.buyer_phone || body.buyerPhone || body.phone || '');
   const appOrderId = String(body.app_order_id || body.orderId || body.order_id || `ZEN-${Date.now()}`);
-  const buyerEmail = String(body.buyer_email || body.email || req.user?.email || 'customer@example.com');
-  const buyerName = String(body.buyer_name || body.name || req.user?.name || 'App Customer');
+  const busId = body.busId || '';
+  const travelDate = body.travelDate || '';
+  const seats = body.seats || [];
 
   if (!amount || !phone) {
     return res.status(400).json({ status: 'error', message: 'Missing amount or phone' });
   }
 
   try {
-    const payload = new URLSearchParams({
-      create_order: '1',
-      buyer_email: buyerEmail,
-      buyer_name: buyerName,
-      buyer_phone: phone,
-      amount: amount,
-      account_id: ZENOPAY_ACCOUNT_ID,
-    });
+    let formattedPhone = phone.trim().replace(/^\+/, '');
+    if (formattedPhone.startsWith('0')) {
+      formattedPhone = '255' + formattedPhone.substring(1);
+    }
 
-    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'x-api-key': ZENOPAY_API_KEY,
-      },
+    const zenoPayload = new URLSearchParams();
+    zenoPayload.append('create_order', '1');
+    zenoPayload.append('api_key', ZENOPAY_API_KEY);
+    zenoPayload.append('account_id', ZENOPAY_ACCOUNT_ID);
+    zenoPayload.append('amount', String(amount));
+    zenoPayload.append('chat_id', formattedPhone);
+    zenoPayload.append('status', 'payment');
+
+    const response = await axios.post("https://zenoapi.com/api/payments", zenoPayload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
 
     const data = response.data || {};
-    console.log('[zenopay-pay] request payload:', payload.toString());
-    console.log('[zenopay-pay] gateway response:', JSON.stringify(data));
-    const zenoOrderId = data.order_id || data.zenoOrderId || appOrderId;
-    // Persist/merge a payments doc so other listeners can pick up the order.
-    try {
-      const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
-      await db.collection('payments').doc(appOrderId).set({
-        userId: req.user?.uid,
-        orderId: appOrderId,
-        zenoOrderId,
-        amount: Number(amount),
-        phone,
-        status: 'pending',
-        pollAttempts: 0,
-        pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    } catch (e) {
-      console.error('🔥 Firestore merge error (zenopay-pay):', e);
-    }
+    const zenoOrderId = data.order_id || appOrderId;
 
-    // Creation accepted — it's still a pending payment until ZenoPay confirms
-    console.log(`[zenopay-pay] persisted payment doc for order=${appOrderId} zenoOrderId=${zenoOrderId}`);
+    const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
+    await db.collection('payments').doc(appOrderId).set({
+      userId: req.user?.uid,
+      orderId: appOrderId,
+      zenoOrderId,
+      amount: Number(amount),
+      phone: formattedPhone,
+      busId: busId,
+      travelDate: travelDate,
+      seats: seats,
+      status: 'pending',
+      pollAttempts: 0,
+      pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    startImmediatePolling(appOrderId, zenoOrderId);
+
     return res.status(200).json({
       status: 'pending',
       message: data.message || 'Request in progress. You will receive a callback shortly',
@@ -560,29 +570,26 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
       raw: data,
     });
   } catch (error) {
-    console.error('❌ ZenoPay proxy error (/zenopay-pay):', error.response?.data || error.message || error);
+    console.error('❌ ZenoPay proxy error (/zenopay-pay):', error.response?.data || error.message);
     return res.status(500).json({ status: 'error', message: 'Failed to contact ZenoPay gateway' });
   }
 });
 
 /**
- * Compatibility polling endpoint for PaymentService which expects `/zenopay-status/:orderId`.
+ * Compatibility polling endpoint for /zenopay-status/:orderId
  */
 app.get('/zenopay-status/:orderId', authenticateAppUser, async (req, res) => {
   const { orderId } = req.params;
   try {
     const orderRef = db.collection('payments').doc(orderId);
     const doc = await orderRef.get();
-
     if (!doc.exists) {
       return res.status(404).json({ status: 'error', message: 'Order records not found' });
     }
-
     let currentStatus = doc.data().status;
     if (currentStatus === 'pending') {
       currentStatus = await checkZenoPayStatusAndUpdate(doc);
     }
-
     return res.status(200).json({ status: 'success', orderId: orderId, paymentStatus: currentStatus });
   } catch (error) {
     console.error('❌ /zenopay-status fetch error:', error);
@@ -590,129 +597,63 @@ app.get('/zenopay-status/:orderId', authenticateAppUser, async (req, res) => {
   }
 });
 
-
 /**
- * Webhook receiver for ZenoPay to notify real-time payment status updates.
- * Secured by either a query `token` matching `ZENOPAY_WEBHOOK_SECRET` or
- * (optionally) by other verification methods if provided.
- * ZenoPay should be configured to POST to: /zenopay-webhook?token=YOUR_SECRET
+ * Webhook receiver (optional, may be used if ZenoPay supports callbacks)
+ * Secured by query token if ZENOPAY_WEBHOOK_SECRET is set.
  */
 app.post('/zenopay-webhook', async (req, res) => {
-  try {
-    const token = String(req.query.token || '').trim();
-    if (ZENOPAY_WEBHOOK_SECRET) {
-      if (!token || token !== ZENOPAY_WEBHOOK_SECRET) {
-        console.warn('⚠️ Zenopay webhook rejected: invalid token');
-        return res.status(403).json({ status: 'error', message: 'Invalid webhook token' });
-      }
-    } else {
-      console.warn('⚠️ Zenopay webhook received but no ZENOPAY_WEBHOOK_SECRET configured. Proceeding cautiously.');
-    }
-
-    const body = req.body || {};
-    // Accept common fields used by ZenoPay integrations
-    const zenoOrderId = String(body.order_id || body.zenoOrderId || body.orderId || '').trim();
-    const remoteStatusRaw = String(body.payment_status || body.status || body.result || '').toLowerCase();
-
-    if (!zenoOrderId && !body.orderId) {
-      console.warn('⚠️ Zenopay webhook missing order id in payload', body);
-      return res.status(400).json({ status: 'error', message: 'Missing order id' });
-    }
-
-    let computedStatus = 'pending';
-    if (["completed", "success", "paid"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'completed';
-    else if (["failed", "declined", "error"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'failed';
-    else if (["cancelled", "expired"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'cancelled';
-
-    // Try to find the payment doc by zenoOrderId first, fallback to orderId
-    let paymentSnap = null;
-    if (zenoOrderId) {
-      const q = await db.collection('payments').where('zenoOrderId', '==', zenoOrderId).limit(1).get();
-      if (!q.empty) paymentSnap = q.docs[0];
-    }
-
-    if (!paymentSnap && body.orderId) {
-      const doc = await db.collection('payments').doc(String(body.orderId)).get();
-      if (doc.exists) paymentSnap = doc;
-    }
-
-    if (!paymentSnap) {
-      console.warn('⚠️ Zenopay webhook: payment record not found for order', zenoOrderId || body.orderId);
-      // Still acknowledge to avoid retries by gateway
-      return res.status(200).json({ status: 'ignored', message: 'No matching payment record' });
-    }
-
-    const paymentData = paymentSnap.data() || {};
-    const prior = (paymentData.status || '').toString().toLowerCase();
-    if (prior === computedStatus) {
-      return res.status(200).json({ status: 'ok', message: 'No change' });
-    }
-
-    // Update payment status and reconcile seats
-    await paymentSnap.ref.update({ status: computedStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-
-    try {
-      if (computedStatus === 'completed') await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
-      else if (['failed', 'cancelled'].includes(computedStatus)) await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
-    } catch (err) {
-      console.error('❌ Zenopay webhook: failed to update seat reservations', err.message || err);
-    }
-
-    return res.status(200).json({ status: 'ok', message: 'processed' });
-  } catch (err) {
-    console.error('❌ /zenopay-webhook error:', err.message || err);
-    return res.status(500).json({ status: 'error', message: 'webhook processing failed' });
+  const token = String(req.query.token || '').trim();
+  const webhookSecret = String(process.env.ZENOPAY_WEBHOOK_SECRET || '').trim();
+  if (webhookSecret && (!token || token !== webhookSecret)) {
+    console.warn('⚠️ Zenopay webhook rejected: invalid token');
+    return res.status(403).json({ status: 'error', message: 'Invalid webhook token' });
   }
+
+  const body = req.body || {};
+  const zenoOrderId = String(body.order_id || body.zenoOrderId || body.orderId || '').trim();
+  const remoteStatusRaw = String(body.payment_status || body.status || body.result || '').toLowerCase();
+
+  if (!zenoOrderId && !body.orderId) {
+    console.warn('⚠️ Zenopay webhook missing order id');
+    return res.status(400).json({ status: 'error', message: 'Missing order id' });
+  }
+
+  let computedStatus = 'pending';
+  if (["completed", "success", "paid"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'completed';
+  else if (["failed", "declined", "error"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'failed';
+  else if (["cancelled", "expired"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'cancelled';
+
+  // Find payment doc by zenoOrderId or orderId
+  let paymentSnap = null;
+  if (zenoOrderId) {
+    const q = await db.collection('payments').where('zenoOrderId', '==', zenoOrderId).limit(1).get();
+    if (!q.empty) paymentSnap = q.docs[0];
+  }
+  if (!paymentSnap && body.orderId) {
+    const doc = await db.collection('payments').doc(String(body.orderId)).get();
+    if (doc.exists) paymentSnap = doc;
+  }
+
+  if (!paymentSnap) {
+    console.warn('⚠️ Zenopay webhook: payment record not found');
+    return res.status(200).json({ status: 'ignored', message: 'No matching payment record' });
+  }
+
+  const paymentData = paymentSnap.data() || {};
+  const prior = (paymentData.status || '').toString().toLowerCase();
+  if (prior === computedStatus) {
+    return res.status(200).json({ status: 'ok', message: 'No change' });
+  }
+
+  await paymentSnap.ref.update({ status: computedStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+  if (computedStatus === 'completed') await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
+  else if (['failed', 'cancelled'].includes(computedStatus)) await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+
+  return res.status(200).json({ status: 'ok', message: 'processed' });
 });
 
-/**
- * Temporary debug endpoint (local-only) to directly call ZenoPay without Firebase auth.
- * Usage: GET /_debug/zenopay?phone=2557XXXXXXX&amount=45000
- * NOTE: Disabled in production for safety.
- */
-app.get('/_debug/zenopay', async (req, res) => {
-  if (isProduction) {
-    return res.status(403).json({ status: 'error', message: 'Debug endpoint disabled in production' });
-  }
-
-  const phone = String(req.query.phone || req.query.buyer_phone || '').trim();
-  const amount = String(req.query.amount || req.query.amt || '').trim();
-
-  if (!phone || !amount) {
-    return res.status(400).json({ status: 'error', message: 'Provide phone and amount query params' });
-  }
-
-  try {
-    const payload = new URLSearchParams({
-      create_order: '1',
-      buyer_phone: phone,
-      amount: amount,
-      account_id: ZENOPAY_ACCOUNT_ID,
-      buyer_email: 'debug@example.com',
-      buyer_name: 'Debug User',
-    });
-
-    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'x-api-key': ZENOPAY_API_KEY,
-      },
-      timeout: 15000,
-    });
-
-    console.log('[_debug/zenopay] response:', response.data);
-    return res.status(200).json({
-      status: 'pending',
-      message: response.data?.message || 'Request in progress. You will receive a callback shortly',
-      raw: response.data,
-    });
-  } catch (err) {
-    console.error('[_debug/zenopay] error:', err.response?.data || err.message || err);
-    return res.status(500).json({ status: 'error', message: err.response?.data || err.message || 'gateway error' });
-  }
-});
-
-// Lightweight health endpoint for uptime/health checks (Render uses this path)
+// Health endpoint
 app.get('/', (req, res) => {
   return res.status(200).json({
     status: 'ok',
@@ -725,14 +666,12 @@ app.get('/', (req, res) => {
 const RESERVATION_CLEANUP_INTERVAL_SECONDS = Number(process.env.RESERVATION_CLEANUP_INTERVAL_SECONDS || 60);
 const RESERVATION_CLEANUP_BATCH_SIZE = Number(process.env.RESERVATION_CLEANUP_BATCH_SIZE || 250);
 
-// Polling worker configuration
+// Payment polling worker configuration (fallback)
 const PAYMENT_POLL_INTERVAL_SECONDS = Number(process.env.PAYMENT_POLL_INTERVAL_SECONDS || 20);
 const PAYMENT_POLL_BATCH_SIZE = Number(process.env.PAYMENT_POLL_BATCH_SIZE || 100);
-const PAYMENT_POLL_CONCURRENCY = Number(process.env.PAYMENT_POLL_CONCURRENCY || 3);
 
 /**
- * Cleanup expired reserved seats by marking them cancelled.
- * Returns the number of reservations cleaned, or -1 on error.
+ * Cleanup expired reserved seats
  */
 async function cleanupExpiredReservations() {
   try {
@@ -753,7 +692,6 @@ async function cleanupExpiredReservations() {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
-
     await batch.commit();
     console.log(`✅ cleanupExpiredReservations: released ${snap.size} reservations`);
     return snap.size;
@@ -763,13 +701,12 @@ async function cleanupExpiredReservations() {
   }
 }
 
-// Manual trigger endpoint (authenticated)
+// Manual cleanup trigger
 app.post('/api/_cleanup-reservations', authenticateAppUser, async (req, res) => {
   try {
     const count = await cleanupExpiredReservations();
     return res.status(200).json({ status: 'success', cleaned: count });
   } catch (err) {
-    console.error('❌ manual cleanup error', err.message || err);
     return res.status(500).json({ status: 'error', message: 'cleanup failed' });
   }
 });
@@ -778,17 +715,14 @@ app.post('/api/_cleanup-reservations', authenticateAppUser, async (req, res) => 
 setInterval(async () => {
   try {
     const cleaned = await cleanupExpiredReservations();
-    if (cleaned > 0) {
-      console.log(`🧹 Periodic cleanup: ${cleaned} expired reservations cleared`);
-    }
+    if (cleaned > 0) console.log(`🧹 Periodic cleanup: ${cleaned} expired reservations cleared`);
   } catch (err) {
     console.error('❌ Periodic cleanup failed:', err.message || err);
   }
 }, RESERVATION_CLEANUP_INTERVAL_SECONDS * 1000);
 
 /**
- * Poll pending payments and reconcile their status with ZenoPay.
- * This acts as a pseudo-webhook provider when actual webhook support is unavailable.
+ * Poll pending payments periodically (fallback for any order that wasn't caught by immediate polling)
  */
 async function pollPendingPayments() {
   try {
@@ -803,42 +737,28 @@ async function pollPendingPayments() {
     let processed = 0;
     for (const doc of snap.docs) {
       const data = doc.data() || {};
-
-      // Skip if pollAttempts already exhausted
       const attempts = Number(data.pollAttempts || 0);
       if (attempts >= PAYMENT_MAX_POLL_ATTEMPTS) {
-        // mark failed if not already
         await doc.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        try { await updateSeatReservationsForOrder(data.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after exhausted failed', e); }
+        await updateSeatReservationsForOrder(data.orderId, 'cancelled');
         processed++;
         continue;
       }
-
-      // If pollDeadline passed, mark failed
       if (data.pollDeadline && data.pollDeadline.toDate && data.pollDeadline.toDate() < new Date()) {
         await doc.ref.update({ status: 'failed', failReason: 'poll_timeout', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        try { await updateSeatReservationsForOrder(data.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after timeout failed', e); }
+        await updateSeatReservationsForOrder(data.orderId, 'cancelled');
         processed++;
         continue;
       }
-
-      // Respect a minimal backoff: if lastPolledAt is recent, skip this doc
       if (data.lastPolledAt && data.lastPolledAt.toDate) {
         const last = data.lastPolledAt.toDate();
         const delta = (Date.now() - last.getTime()) / 1000;
-        if (delta < PAYMENT_POLL_INTERVAL_SECONDS / 2) {
-          continue; // skip recently-polled docs
-        }
+        if (delta < PAYMENT_POLL_INTERVAL_SECONDS / 2) continue;
       }
-
-      // Perform the remote status check and reconciliation
       await checkZenoPayStatusAndUpdate(doc);
       processed++;
-
-      // Gentle throttling to avoid hammering remote gateway
       await new Promise((r) => setTimeout(r, 100));
     }
-
     if (processed > 0) console.log(`🕵️ Polling: processed ${processed} pending payments`);
     return processed;
   } catch (err) {
@@ -847,7 +767,7 @@ async function pollPendingPayments() {
   }
 }
 
-// Periodic polling loop
+// Periodic polling loop (fallback)
 setInterval(async () => {
   try {
     await pollPendingPayments();
@@ -856,21 +776,48 @@ setInterval(async () => {
   }
 }, PAYMENT_POLL_INTERVAL_SECONDS * 1000);
 
-// Manual trigger for admins/developers (authenticated)
+// Manual poll trigger
 app.post('/api/_poll-pending-payments', authenticateAppUser, async (req, res) => {
   try {
     const count = await pollPendingPayments();
     return res.status(200).json({ status: 'success', processed: count });
   } catch (err) {
-    console.error('❌ manual poll trigger failed:', err.message || err);
     return res.status(500).json({ status: 'error', message: 'poll failed' });
   }
 });
 
-// Port Execution Configuration
+// Debug endpoint (disabled in production)
+app.get('/_debug/zenopay', async (req, res) => {
+  if (isProduction) {
+    return res.status(403).json({ status: 'error', message: 'Debug endpoint disabled in production' });
+  }
+  const phone = String(req.query.phone || '').trim();
+  const amount = String(req.query.amount || '').trim();
+  if (!phone || !amount) {
+    return res.status(400).json({ status: 'error', message: 'Provide phone and amount query params' });
+  }
+  try {
+    let formattedPhone = phone.replace(/^\+/, '');
+    if (formattedPhone.startsWith('0')) formattedPhone = '255' + formattedPhone.substring(1);
+    const payload = new URLSearchParams();
+    payload.append('create_order', '1');
+    payload.append('api_key', ZENOPAY_API_KEY);
+    payload.append('account_id', ZENOPAY_ACCOUNT_ID);
+    payload.append('amount', amount);
+    payload.append('chat_id', formattedPhone);
+    payload.append('status', 'payment');
+    const response = await axios.post("https://zenoapi.com/api/payments", payload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
+    });
+    return res.status(200).json({ status: 'pending', raw: response.data });
+  } catch (err) {
+    return res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 10000;
-// Bind host explicitly so devices on the LAN can reach the server during local testing
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, () => {
-  console.log(`🚀 Server running smoothly on ${HOST}:${PORT}`);
+  console.log(`🚀 Server running on ${HOST}:${PORT}`);
 });
