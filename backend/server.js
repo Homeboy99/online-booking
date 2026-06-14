@@ -57,6 +57,9 @@ const ZENOPAY_API_KEY = String(process.env.ZENOPAY_API_KEY || "").trim();
 const ZENOPAY_ACCOUNT_ID = String(process.env.ZENOPAY_ACCOUNT_ID || "").trim();
 // ZENOPAY_WEBHOOK_SECRET is optional – not required for polling
 
+// Use base URL from env if set (e.g. https://api.zeno.africa)
+const ZENOPAY_BASE_URL = String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com').replace(/\/$/, '');
+
 // Payment polling configuration
 const PAYMENT_POLL_TTL_SECONDS = Number(process.env.PAYMENT_POLL_TTL_SECONDS || 900); // 15 minutes default
 const PAYMENT_MAX_POLL_ATTEMPTS = Number(process.env.PAYMENT_MAX_POLL_ATTEMPTS || 8);
@@ -215,7 +218,6 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
     // Correct ZenoPay push payload
     const zenoPayload = new URLSearchParams();
     zenoPayload.append('create_order', '1');
-    zenoPayload.append('api_key', ZENOPAY_API_KEY);
     zenoPayload.append('account_id', ZENOPAY_ACCOUNT_ID);
     zenoPayload.append('amount', String(amount));
     zenoPayload.append('chat_id', formattedPhone);
@@ -223,8 +225,8 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
 
     console.log(`[ZenoPay] Initializing payment for order ${orderId}, phone ${formattedPhone}, amount ${amount}`);
 
-    const zenoResponse = await axios.post("https://zenoapi.com/api/payments", zenoPayload.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    const zenoResponse = await axios.post(`${ZENOPAY_BASE_URL}/api/payments`, zenoPayload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-api-key': ZENOPAY_API_KEY },
       timeout: 15000
     });
 
@@ -294,11 +296,10 @@ async function startImmediatePolling(orderId, zenoOrderId, attempt = 1) {
       // Correct status check payload
       const checkPayload = new URLSearchParams();
       checkPayload.append('check_order', '1');
-      checkPayload.append('api_key', ZENOPAY_API_KEY);
       checkPayload.append('order_id', zenoOrderId);
 
-      const response = await axios.post("https://zenoapi.com/api/payments", checkPayload.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      const response = await axios.post(`${ZENOPAY_BASE_URL}/api/payments`, checkPayload.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-api-key': ZENOPAY_API_KEY },
         timeout: 10000
       });
 
@@ -530,14 +531,13 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
 
     const zenoPayload = new URLSearchParams();
     zenoPayload.append('create_order', '1');
-    zenoPayload.append('api_key', ZENOPAY_API_KEY);
     zenoPayload.append('account_id', ZENOPAY_ACCOUNT_ID);
     zenoPayload.append('amount', String(amount));
     zenoPayload.append('chat_id', formattedPhone);
     zenoPayload.append('status', 'payment');
 
-    const response = await axios.post("https://zenoapi.com/api/payments", zenoPayload.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    const response = await axios.post(`${ZENOPAY_BASE_URL}/api/payments`, zenoPayload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-api-key': ZENOPAY_API_KEY },
     });
 
     const data = response.data || {};
@@ -806,8 +806,8 @@ app.get('/_debug/zenopay', async (req, res) => {
     payload.append('amount', amount);
     payload.append('chat_id', formattedPhone);
     payload.append('status', 'payment');
-    const response = await axios.post("https://zenoapi.com/api/payments", payload.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    const response = await axios.post(`${ZENOPAY_BASE_URL}/api/payments`, payload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-api-key': ZENOPAY_API_KEY },
       timeout: 15000,
     });
     return res.status(200).json({ status: 'pending', raw: response.data });
