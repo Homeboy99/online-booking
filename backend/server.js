@@ -113,6 +113,23 @@ async function authenticateAppUser(req, res, next) {
     if (!idToken) {
       return res.status(401).json({ status: "failed", message: "Missing Firebase auth token" });
     }
+
+    // Debug: decode token payload (without verification) to inspect iat/exp
+    try {
+      const parts = idToken.split('.');
+      if (parts.length === 3) {
+        const payloadJson = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+        const payload = JSON.parse(payloadJson);
+        const iat = payload.iat;
+        const exp = payload.exp;
+        console.log(`🔐 ID token debug: iat=${new Date(iat * 1000).toISOString()} exp=${new Date(exp * 1000).toISOString()} now=${new Date().toISOString()}`);
+      } else {
+        console.log('🔐 ID token debug: unexpected token format');
+      }
+    } catch (dbgErr) {
+      console.log('🔐 ID token debug parse failed:', dbgErr.message);
+    }
+
     req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (error) {
