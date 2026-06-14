@@ -58,6 +58,12 @@ const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
 // ZenoPay Configurations pulled from Render
 const ZENOPAY_API_KEY = String(process.env.ZENOPAY_API_KEY || "").trim();
 const ZENOPAY_ACCOUNT_ID = String(process.env.ZENOPAY_ACCOUNT_ID || "").trim();
+const ZENOPAY_SECRET_KEY = String(process.env.ZENOPAY_SECRET_KEY || "").trim();
+const ZENOPAY_WEBHOOK_SECRET = String(process.env.ZENOPAY_WEBHOOK_SECRET || "").trim();
+
+// Payment polling configuration
+const PAYMENT_POLL_TTL_SECONDS = Number(process.env.PAYMENT_POLL_TTL_SECONDS || 900); // 15 minutes default
+const PAYMENT_MAX_POLL_ATTEMPTS = Number(process.env.PAYMENT_MAX_POLL_ATTEMPTS || 8);
 
 const app = express();
 app.disable("x-powered-by");
@@ -243,6 +249,7 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
       const zenoOrderId = data.order_id || orderId;
 
       // Track local ledger item marked pending initially
+      const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
       await db.collection("payments").doc(orderId).set({
         userId: req.user.uid,
         orderId: orderId,
@@ -250,6 +257,8 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
         amount: amount,
         phone: phone,
         status: "pending",
+        pollAttempts: 0,
+        pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -278,7 +287,34 @@ app.post("/api/payments/initialize", authenticateAppUser, async (req, res) => {
  * Worker Function: Queries active status from ZenoPay to reconcile pending logs
  */
 async function checkZenoPayStatusAndUpdate(orderDoc) {
-  const paymentData = orderDoc.data();
+  // Refresh the snapshot to ensure we act on the latest state
+  const fresh = await orderDoc.ref.get();
+  const paymentData = fresh.data();
+  if (!paymentData) return null;
+
+  const currentStatus = (paymentData.status || '').toString().toLowerCase();
+  if (currentStatus !== 'pending') {
+    // No work to do if someone already cancelled or completed the order
+    return currentStatus;
+  }
+
+  // If we've passed the polling deadline, mark failed (timeout)
+  try {
+    const now = new Date();
+    if (paymentData.pollDeadline && paymentData.pollDeadline.toDate && paymentData.pollDeadline.toDate() < now) {
+      await fresh.ref.update({
+        status: 'failed',
+        failReason: 'poll_timeout',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after timeout failed', e); }
+      return 'failed';
+    }
+  } catch (e) {
+    console.error('❌ Poll-deadline check failed:', e.message || e);
+  }
+
+  // Query remote gateway for authoritative status
   try {
     const payload = new URLSearchParams({
       check_status: "1",
@@ -286,47 +322,77 @@ async function checkZenoPayStatusAndUpdate(orderDoc) {
       account_id: ZENOPAY_ACCOUNT_ID
     });
 
-    const response = await axios.post("https://zenoapi.com", payload.toString(), {
+    const response = await axios.post(String(process.env.ZENOPAY_BASE_URL || 'https://zenoapi.com'), payload.toString(), {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "x-api-key": ZENOPAY_API_KEY
-      }
+      },
+      timeout: 15000,
     });
 
     const remoteStatus = String(response.data?.payment_status || response.data?.status || "").toLowerCase();
-    let computedStatus = "pending";
+    let computedStatus = 'pending';
+    if (["completed", "success", "paid"].some(s => remoteStatus.includes(s))) computedStatus = 'completed';
+    else if (["failed", "declined", "error"].some(s => remoteStatus.includes(s))) computedStatus = 'failed';
+    else if (["cancelled", "expired"].some(s => remoteStatus.includes(s))) computedStatus = 'cancelled';
 
-    if (["completed", "success", "paid"].some(s => remoteStatus.includes(s))) {
-      computedStatus = "completed";
-    } else if (["failed", "declined", "error"].some(s => remoteStatus.includes(s))) {
-      computedStatus = "failed";
-    } else if (["cancelled", "expired"].some(s => remoteStatus.includes(s))) {
-      computedStatus = "cancelled";
+    // Re-fetch to make sure status wasn't changed while we queried remote
+    const latest = await orderDoc.ref.get();
+    const latestStatus = (latest.data()?.status || '').toString().toLowerCase();
+    if (latestStatus !== 'pending') return latestStatus;
+
+    // Prepare fields to update (increment attempts + timestamps)
+    const updates = {
+      lastPolledAt: admin.firestore.FieldValue.serverTimestamp(),
+      pollAttempts: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (computedStatus !== 'pending') {
+      updates.status = computedStatus;
     }
 
-    if (computedStatus !== paymentData.status) {
-      await orderDoc.ref.update({
-        status: computedStatus,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+    await latest.ref.update(updates);
 
-      // Update any seat reservations tied to this order
-      try {
-        if (computedStatus === 'completed') {
-          await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
-        } else if (['failed', 'cancelled', 'cancel', 'error', 'expired', 'timeout'].some(s => computedStatus.includes(s))) {
-          await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
-        }
-      } catch (innerErr) {
-        console.error('❌ Failed to update seat reservations for order:', innerErr.message || innerErr);
+    // If we still have a pending after incrementing attempts, check attempts/deadline to possibly fail
+    if (computedStatus === 'pending') {
+      const post = await orderDoc.ref.get();
+      const attempts = Number(post.data()?.pollAttempts || 0);
+      const deadline = post.data()?.pollDeadline;
+      if (attempts >= PAYMENT_MAX_POLL_ATTEMPTS || (deadline && deadline.toDate && deadline.toDate() < new Date())) {
+        await post.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after exhausted failed', e); }
+        return 'failed';
       }
-
-      return computedStatus;
+      return 'pending';
     }
 
-    return paymentData.status;
+    // If status moved to a final state, reconcile reservations
+    try {
+      if (computedStatus === 'completed') {
+        await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
+      } else if (['failed', 'cancelled'].includes(computedStatus)) {
+        await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+      }
+    } catch (innerErr) {
+      console.error('❌ Failed to update seat reservations for order:', innerErr.message || innerErr);
+    }
+
+    return computedStatus;
   } catch (err) {
-    console.error("Status check operation failed:", err.message);
+    console.error("Status check operation failed:", err.message || err);
+    // If status check failed, increment attempts and return current status
+    try {
+      await orderDoc.ref.update({ pollAttempts: admin.firestore.FieldValue.increment(1), lastPolledAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      const post = await orderDoc.ref.get();
+      if (Number(post.data()?.pollAttempts || 0) >= PAYMENT_MAX_POLL_ATTEMPTS) {
+        await post.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        try { await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after error exhausted failed', e); }
+        return 'failed';
+      }
+    } catch (e) {
+      console.error('❌ failed to increment pollAttempts after error:', e.message || e);
+    }
     return paymentData.status;
   }
 }
@@ -465,9 +531,9 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
     console.log('[zenopay-pay] request payload:', payload.toString());
     console.log('[zenopay-pay] gateway response:', JSON.stringify(data));
     const zenoOrderId = data.order_id || data.zenoOrderId || appOrderId;
-
     // Persist/merge a payments doc so other listeners can pick up the order.
     try {
+      const pollDeadline = new Date(Date.now() + PAYMENT_POLL_TTL_SECONDS * 1000);
       await db.collection('payments').doc(appOrderId).set({
         userId: req.user?.uid,
         orderId: appOrderId,
@@ -475,6 +541,8 @@ app.post('/zenopay-pay', authenticateAppUser, async (req, res) => {
         amount: Number(amount),
         phone,
         status: 'pending',
+        pollAttempts: 0,
+        pollDeadline: admin.firestore.Timestamp.fromDate(pollDeadline),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -519,6 +587,81 @@ app.get('/zenopay-status/:orderId', authenticateAppUser, async (req, res) => {
   } catch (error) {
     console.error('❌ /zenopay-status fetch error:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to resolve payment status' });
+  }
+});
+
+
+/**
+ * Webhook receiver for ZenoPay to notify real-time payment status updates.
+ * Secured by either a query `token` matching `ZENOPAY_WEBHOOK_SECRET` or
+ * (optionally) by other verification methods if provided.
+ * ZenoPay should be configured to POST to: /zenopay-webhook?token=YOUR_SECRET
+ */
+app.post('/zenopay-webhook', async (req, res) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    if (ZENOPAY_WEBHOOK_SECRET) {
+      if (!token || token !== ZENOPAY_WEBHOOK_SECRET) {
+        console.warn('⚠️ Zenopay webhook rejected: invalid token');
+        return res.status(403).json({ status: 'error', message: 'Invalid webhook token' });
+      }
+    } else {
+      console.warn('⚠️ Zenopay webhook received but no ZENOPAY_WEBHOOK_SECRET configured. Proceeding cautiously.');
+    }
+
+    const body = req.body || {};
+    // Accept common fields used by ZenoPay integrations
+    const zenoOrderId = String(body.order_id || body.zenoOrderId || body.orderId || '').trim();
+    const remoteStatusRaw = String(body.payment_status || body.status || body.result || '').toLowerCase();
+
+    if (!zenoOrderId && !body.orderId) {
+      console.warn('⚠️ Zenopay webhook missing order id in payload', body);
+      return res.status(400).json({ status: 'error', message: 'Missing order id' });
+    }
+
+    let computedStatus = 'pending';
+    if (["completed", "success", "paid"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'completed';
+    else if (["failed", "declined", "error"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'failed';
+    else if (["cancelled", "expired"].some(s => remoteStatusRaw.includes(s))) computedStatus = 'cancelled';
+
+    // Try to find the payment doc by zenoOrderId first, fallback to orderId
+    let paymentSnap = null;
+    if (zenoOrderId) {
+      const q = await db.collection('payments').where('zenoOrderId', '==', zenoOrderId).limit(1).get();
+      if (!q.empty) paymentSnap = q.docs[0];
+    }
+
+    if (!paymentSnap && body.orderId) {
+      const doc = await db.collection('payments').doc(String(body.orderId)).get();
+      if (doc.exists) paymentSnap = doc;
+    }
+
+    if (!paymentSnap) {
+      console.warn('⚠️ Zenopay webhook: payment record not found for order', zenoOrderId || body.orderId);
+      // Still acknowledge to avoid retries by gateway
+      return res.status(200).json({ status: 'ignored', message: 'No matching payment record' });
+    }
+
+    const paymentData = paymentSnap.data() || {};
+    const prior = (paymentData.status || '').toString().toLowerCase();
+    if (prior === computedStatus) {
+      return res.status(200).json({ status: 'ok', message: 'No change' });
+    }
+
+    // Update payment status and reconcile seats
+    await paymentSnap.ref.update({ status: computedStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    try {
+      if (computedStatus === 'completed') await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
+      else if (['failed', 'cancelled'].includes(computedStatus)) await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+    } catch (err) {
+      console.error('❌ Zenopay webhook: failed to update seat reservations', err.message || err);
+    }
+
+    return res.status(200).json({ status: 'ok', message: 'processed' });
+  } catch (err) {
+    console.error('❌ /zenopay-webhook error:', err.message || err);
+    return res.status(500).json({ status: 'error', message: 'webhook processing failed' });
   }
 });
 
