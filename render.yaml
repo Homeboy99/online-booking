@@ -18,6 +18,8 @@ services:
         sync: false
       - key: FIREBASE_PRIVATE_KEY
         sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false
       - key: ZENOPAY_API_KEY
         sync: false
       - key: ZENOPAY_ACCOUNT_ID

@@ -92,7 +92,11 @@ class PaymentService {
 
     try {
       // Force a fresh ID token to avoid using an expired token
-      final idToken = await user.getIdToken(true);
+      final String? idToken = await user.getIdToken(true);
+      // Debug: log token iat/exp to help diagnose expired-token issues
+      try {
+        await _logIdTokenInfo(idToken, tag: 'initiateZenopayPayment');
+      } catch (_) {}
       if (idToken == null || idToken.isEmpty) {
         return PaymentInitResult(
           status: PaymentInitStatus.failed,
@@ -248,7 +252,11 @@ class PaymentService {
       }
 
       // Force refresh the ID token before contacting backend
-      final idToken = await user.getIdToken(true);
+      final String? idToken = await user.getIdToken(true);
+      // Debug: log token iat/exp so server and client timing can be compared
+      try {
+        await _logIdTokenInfo(idToken, tag: 'syncPendingPaymentStatus');
+      } catch (_) {}
       if (idToken == null || idToken.isEmpty) {
         debugPrint('💥 ZENOPAY STATUS SYNC ERROR: Missing auth token.');
         return;
@@ -531,5 +539,37 @@ class PaymentService {
       if (value.contains(needle)) return true;
     }
     return false;
+  }
+
+  Future<void> _logIdTokenInfo(String? idToken, {String tag = ''}) async {
+    if (idToken == null || idToken.isEmpty) return;
+    try {
+      final parts = idToken.split('.');
+      if (parts.length < 2) return;
+      String payload = parts[1];
+      String normalized = payload.replaceAll('-', '+').replaceAll('_', '/');
+      switch (normalized.length % 4) {
+        case 2:
+          normalized = normalized + '==';
+          break;
+        case 3:
+          normalized = normalized + '=';
+          break;
+        default:
+          break;
+      }
+      final decoded = utf8.decode(base64.decode(normalized));
+      final Map<String, dynamic> map = jsonDecode(decoded);
+      final int? iat = map['iat'] is int
+          ? map['iat'] as int
+          : (map['iat'] is double ? (map['iat'] as double).toInt() : null);
+      final int? exp = map['exp'] is int
+          ? map['exp'] as int
+          : (map['exp'] is double ? (map['exp'] as double).toInt() : null);
+      debugPrint(
+          '🔑 TokenDebug[$tag]: iat=${iat != null ? DateTime.fromMillisecondsSinceEpoch(iat * 1000).toUtc().toIso8601String() : 'unknown'} exp=${exp != null ? DateTime.fromMillisecondsSinceEpoch(exp * 1000).toUtc().toIso8601String() : 'unknown'} now=${DateTime.now().toUtc().toIso8601String()}');
+    } catch (e) {
+      debugPrint('🔑 TokenDebug parse error: $e');
+    }
   }
 }
