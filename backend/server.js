@@ -93,6 +93,72 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Reservation hold window (seconds) default 15 minutes
+const RESERVATION_HOLD_SECONDS = Number(process.env.RESERVATION_HOLD_SECONDS || 900);
+
+/**
+ * Reserve seats atomically for a given bus and travel date.
+ * Request body: { busId, travelDate (ISO date), seats: ["1","2"], orderId }
+ */
+app.post('/api/reserve-seats', authenticateAppUser, async (req, res) => {
+  const { busId, travelDate, seats, orderId } = req.body || {};
+
+  if (!busId || !travelDate || !Array.isArray(seats) || seats.length === 0 || !orderId) {
+    return res.status(400).json({ status: 'error', message: 'Missing busId, travelDate, seats, or orderId' });
+  }
+
+  try {
+    // Normalize date to yyyy-mm-dd
+    const date = new Date(travelDate);
+    if (isNaN(date.getTime())) {
+      return res.status(400).json({ status: 'error', message: 'Invalid travelDate' });
+    }
+    const isoDate = date.toISOString().slice(0, 10);
+    const reservedUntil = new Date(Date.now() + RESERVATION_HOLD_SECONDS * 1000);
+
+    const seatRefs = seats.map(seat => db.collection('seat_reservations').doc(`${busId}_${isoDate}_${seat}`));
+
+    await db.runTransaction(async (tx) => {
+      // Validate availability
+      for (let i = 0; i < seatRefs.length; i++) {
+        const snap = await tx.get(seatRefs[i]);
+        if (snap.exists) {
+          const data = snap.data() || {};
+          const status = (data.status || '').toString().toLowerCase();
+          const until = data.reservedUntil ? data.reservedUntil.toDate() : null;
+          if (status === 'booked') {
+            throw new Error(`Seat ${seats[i]} already booked`);
+          }
+          if (status === 'reserved' && until && until > new Date()) {
+            throw new Error(`Seat ${seats[i]} currently reserved`);
+          }
+        }
+      }
+
+      // Reserve seats
+      for (let i = 0; i < seatRefs.length; i++) {
+        tx.set(seatRefs[i], {
+          busId,
+          travelDate: isoDate,
+          seatNumber: seats[i],
+          orderId,
+          userId: req.user.uid || null,
+          status: 'reserved',
+          reservedAt: admin.firestore.FieldValue.serverTimestamp(),
+          reservedUntil: admin.firestore.Timestamp.fromDate(reservedUntil),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+    });
+
+    return res.status(200).json({ status: 'success', message: 'Seats reserved', reservedUntil: reservedUntil.toISOString() });
+  } catch (err) {
+    console.error('❌ Seat reservation error:', err.message || err);
+    return res.status(409).json({ status: 'failed', message: err.message || 'Seat reservation failed' });
+  }
+});
+
+
 /**
  * Authenticates users requesting endpoints using Firebase Auth ID Tokens
  */
@@ -242,6 +308,18 @@ async function checkZenoPayStatusAndUpdate(orderDoc) {
         status: computedStatus,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
+
+      // Update any seat reservations tied to this order
+      try {
+        if (computedStatus === 'completed') {
+          await updateSeatReservationsForOrder(paymentData.orderId, 'booked');
+        } else if (['failed', 'cancelled', 'cancel', 'error', 'expired', 'timeout'].some(s => computedStatus.includes(s))) {
+          await updateSeatReservationsForOrder(paymentData.orderId, 'cancelled');
+        }
+      } catch (innerErr) {
+        console.error('❌ Failed to update seat reservations for order:', innerErr.message || innerErr);
+      }
+
       return computedStatus;
     }
 
@@ -251,6 +329,69 @@ async function checkZenoPayStatusAndUpdate(orderDoc) {
     return paymentData.status;
   }
 }
+
+/**
+ * Update seat reservation docs for an orderId
+ * newStatus: 'booked' or 'cancelled'
+ */
+async function updateSeatReservationsForOrder(orderId, newStatus) {
+  if (!orderId) return;
+  const snaps = await db.collection('seat_reservations').where('orderId', '==', orderId).get();
+  if (snaps.empty) return;
+  const batch = db.batch();
+  snaps.forEach(doc => {
+    const updates = {
+      status: newStatus,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (newStatus === 'booked') {
+      updates.bookedAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+    batch.update(doc.ref, updates);
+  });
+  await batch.commit();
+}
+
+/**
+ * Cancel an order server-side and release reservations
+ * POST body: { orderId, reason }
+ */
+app.post('/api/cancel-order', authenticateAppUser, async (req, res) => {
+  const { orderId, reason } = req.body || {};
+  if (!orderId) {
+    return res.status(400).json({ status: 'error', message: 'Missing orderId' });
+  }
+
+  try {
+    const orderRef = db.collection('payments').doc(orderId);
+    const resTx = await db.runTransaction(async (tx) => {
+      const doc = await tx.get(orderRef);
+      if (!doc.exists) return { ok: false, message: 'Order not found' };
+      const data = doc.data() || {};
+      const status = (data.status || '').toLowerCase();
+      if (status === 'completed') return { ok: false, message: 'Order already completed' };
+      tx.update(orderRef, { status: 'cancelled', cancelReason: reason || 'user_cancelled', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return { ok: true };
+    });
+
+    if (!resTx.ok) {
+      return res.status(400).json({ status: 'failed', message: resTx.message });
+    }
+
+    // Update reservations
+    try {
+      await updateSeatReservationsForOrder(orderId, 'cancelled');
+    } catch (err) {
+      console.error('❌ Failed to release reservations on cancel:', err.message || err);
+    }
+
+    return res.status(200).json({ status: 'success', message: 'Order cancelled' });
+  } catch (err) {
+    console.error('❌ /api/cancel-order error:', err.message || err);
+    return res.status(500).json({ status: 'error', message: 'Failed to cancel order' });
+  }
+});
+
 
 /**
  * Polling Route: Client application requests state evaluation via intervals
@@ -432,6 +573,66 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+// Reservation cleanup configuration
+const RESERVATION_CLEANUP_INTERVAL_SECONDS = Number(process.env.RESERVATION_CLEANUP_INTERVAL_SECONDS || 60);
+const RESERVATION_CLEANUP_BATCH_SIZE = Number(process.env.RESERVATION_CLEANUP_BATCH_SIZE || 250);
+
+/**
+ * Cleanup expired reserved seats by marking them cancelled.
+ * Returns the number of reservations cleaned, or -1 on error.
+ */
+async function cleanupExpiredReservations() {
+  try {
+    const now = admin.firestore.Timestamp.now();
+    const q = db.collection('seat_reservations')
+      .where('status', '==', 'reserved')
+      .where('reservedUntil', '<=', now)
+      .limit(RESERVATION_CLEANUP_BATCH_SIZE);
+
+    const snap = await q.get();
+    if (snap.empty) return 0;
+
+    const batch = db.batch();
+    snap.forEach(doc => {
+      batch.update(doc.ref, {
+        status: 'cancelled',
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    await batch.commit();
+    console.log(`✅ cleanupExpiredReservations: released ${snap.size} reservations`);
+    return snap.size;
+  } catch (err) {
+    console.error('❌ cleanupExpiredReservations error:', err.message || err);
+    return -1;
+  }
+}
+
+// Manual trigger endpoint (authenticated)
+app.post('/api/_cleanup-reservations', authenticateAppUser, async (req, res) => {
+  try {
+    const count = await cleanupExpiredReservations();
+    return res.status(200).json({ status: 'success', cleaned: count });
+  } catch (err) {
+    console.error('❌ manual cleanup error', err.message || err);
+    return res.status(500).json({ status: 'error', message: 'cleanup failed' });
+  }
+});
+
+// Start periodic cleanup loop
+setInterval(async () => {
+  try {
+    const cleaned = await cleanupExpiredReservations();
+    if (cleaned > 0) {
+      console.log(`🧹 Periodic cleanup: ${cleaned} expired reservations cleared`);
+    }
+  } catch (err) {
+    console.error('❌ Periodic cleanup failed:', err.message || err);
+  }
+}, RESERVATION_CLEANUP_INTERVAL_SECONDS * 1000);
 
 // Port Execution Configuration
 const PORT = process.env.PORT || 10000;

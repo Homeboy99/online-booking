@@ -175,22 +175,40 @@ class _PaymentPageState extends State<PaymentPage> {
     final double totalAmount = _calculateTotal();
     final String paymentReference = _buildPaymentReference(totalAmount);
     final user = FirebaseAuth.instance.currentUser;
-    String? orderId;
-    if (selectedPaymentType == 'mobile') {
-      orderId = "ZEN-${DateTime.now().millisecondsSinceEpoch}";
-      _latestOrderId = orderId;
-    } else {
-      _latestOrderId = null;
-    }
+    // Always create an orderId so we can reserve seats regardless of method
+    final String orderId = "ZEN-${DateTime.now().millisecondsSinceEpoch}";
+    _latestOrderId = orderId;
 
     try {
+      // Reserve seats on the server before initiating payment
+      final bool reserved = await _paymentService.reserveSeats(
+        orderId: orderId,
+        busId: widget.bus.id,
+        travelDate: widget.travelDate,
+        seats: widget.selectedSeats,
+      );
+
+      if (!reserved) {
+        if (mounted) {
+          setState(() => _isProcessing = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Selected seats are no longer available.'),
+              backgroundColor: AppColors.error,
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+        return;
+      }
+
       final PaymentInitResult result = selectedPaymentType == 'mobile'
           ? await _paymentService.initiateZenopayPayment(
               phoneNumber: _paymentPhoneController.text,
               amount: totalAmount,
               email: user?.email ?? "traveler@heches.com",
               fullName: widget.passengerNames[0],
-              orderId: orderId!,
+              orderId: orderId,
               paymentReference: paymentReference,
             )
           : await _paymentService.initiateBank(
@@ -198,6 +216,7 @@ class _PaymentPageState extends State<PaymentPage> {
               amount: totalAmount,
               email: user?.email ?? "traveler@heches.com",
               fullName: widget.passengerNames[0],
+              orderId: orderId,
             );
 
       final String? trackedOrderId = result.orderId ?? orderId;
@@ -362,27 +381,8 @@ class _PaymentPageState extends State<PaymentPage> {
   Future<bool> _cancelPendingPayment(String orderId,
       {required String reason}) async {
     try {
-      final ref =
-          FirebaseFirestore.instance.collection('payments').doc(orderId);
-      return await FirebaseFirestore.instance.runTransaction((tx) async {
-        final snap = await tx.get(ref);
-        if (!snap.exists) return false;
-        final data = snap.data() ?? {};
-        final status = (data['status'] ?? '').toString().toLowerCase();
-        if (status == 'completed') return false;
-        if (status == 'failed' ||
-            status == 'cancelled' ||
-            status == 'canceled' ||
-            status == 'error') {
-          return false;
-        }
-        tx.update(ref, {
-          'status': 'cancelled',
-          'cancelReason': reason,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-        return true;
-      });
+      final didCancel = await _paymentService.cancelOrder(orderId, reason: reason);
+      return didCancel;
     } catch (_) {
       return false;
     }

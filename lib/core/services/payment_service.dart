@@ -186,6 +186,64 @@ class PaymentService {
     }
   }
 
+  /// Reserve seats via backend before initiating payment
+  Future<bool> reserveSeats({
+    required String orderId,
+    required String busId,
+    required DateTime travelDate,
+    required List<String> seats,
+  }) async {
+    if (backendBaseUrl.isEmpty) return false;
+    final user = _auth.currentUser;
+    if (user == null) return false;
+
+    try {
+      final String? idToken = await user.getIdToken(true);
+      await _logIdTokenInfo(idToken, tag: 'reserveSeats');
+      if (idToken == null || idToken.isEmpty) return false;
+      final resp = await _dio.post(
+        '$backendBaseUrl/api/reserve-seats',
+        data: {
+          'busId': busId,
+          'travelDate': travelDate.toIso8601String(),
+          'seats': seats,
+          'orderId': orderId,
+        },
+        options: Options(headers: {'Authorization': 'Bearer $idToken'}),
+      );
+      final data = resp.data;
+      if (data is Map && (data['status'] == 'success' || data['status'] == 'ok')) {
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('🔥 reserveSeats failed: $e');
+      return false;
+    }
+  }
+
+  /// Cancel order via backend (releases reservations)
+  Future<bool> cancelOrder(String orderId, {String? reason}) async {
+    if (backendBaseUrl.isEmpty) return false;
+    final user = _auth.currentUser;
+    if (user == null) return false;
+    try {
+      final String? idToken = await user.getIdToken(true);
+      await _logIdTokenInfo(idToken, tag: 'cancelOrder');
+      if (idToken == null || idToken.isEmpty) return false;
+      final resp = await _dio.post(
+        '$backendBaseUrl/api/cancel-order',
+        data: {'orderId': orderId, if (reason != null) 'reason': reason},
+        options: Options(headers: {'Authorization': 'Bearer $idToken'}),
+      );
+      final data = resp.data;
+      return data is Map && data['status'] == 'success';
+    } catch (e) {
+      debugPrint('🔥 cancelOrder failed: $e');
+      return false;
+    }
+  }
+
   /// Save transaction to Firebase
   Future<void> _saveTransactionToFirebase({
     required String orderId,
@@ -315,16 +373,17 @@ class PaymentService {
     required double amount,
     required String email,
     required String fullName,
+    String? orderId,
   }) async {
     // For now, mapping Bank to the same Zenopay flow or a custom instruction
-    final String orderId = "ZEN-BANK-${DateTime.now().millisecondsSinceEpoch}";
+    final String resolvedOrderId = orderId ?? "ZEN-BANK-${DateTime.now().millisecondsSinceEpoch}";
     return await initiateZenopayPayment(
       phoneNumber:
           "", // Usually bank doesn't need phone for STK but Zenopay might
       amount: amount,
       email: email,
       fullName: fullName,
-      orderId: orderId,
+      orderId: resolvedOrderId,
     );
   }
 

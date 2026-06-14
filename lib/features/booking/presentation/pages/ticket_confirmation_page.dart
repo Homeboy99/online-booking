@@ -182,27 +182,8 @@ class _TicketConfirmationPageState extends State<TicketConfirmationPage> {
   Future<bool> _cancelPendingPayment(String orderId,
       {required String reason}) async {
     try {
-      final ref =
-          FirebaseFirestore.instance.collection('payments').doc(orderId);
-      return await FirebaseFirestore.instance.runTransaction((tx) async {
-        final snap = await tx.get(ref);
-        if (!snap.exists) return false;
-        final data = snap.data() ?? {};
-        final status = (data['status'] ?? '').toString().toLowerCase();
-        if (status == 'completed') return false;
-        if (status == 'failed' ||
-            status == 'cancelled' ||
-            status == 'canceled' ||
-            status == 'error') {
-          return false;
-        }
-        tx.update(ref, {
-          'status': 'cancelled',
-          'cancelReason': reason,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-        return true;
-      });
+      final didCancel = await _paymentService.cancelOrder(orderId, reason: reason);
+      return didCancel;
     } catch (_) {
       return false;
     }

@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:animate_do/animate_do.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../search/domain/entities/bus.dart';
 import 'passenger_details_page.dart';
@@ -19,6 +22,9 @@ class SeatSelectionPage extends StatefulWidget {
 
 class _SeatSelectionPageState extends State<SeatSelectionPage> {
   final List<int> selectedSeats = [];
+  final Set<int> _bookedSeats = {};
+  final Set<int> _reservedSeats = {};
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _reservationsSub;
 
   double _calculateTotal() {
     double total = 0;
@@ -53,6 +59,70 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
       ),
       bottomSheet: _buildBookingSummary(),
     );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribeToSeatReservations();
+  }
+
+  @override
+  void dispose() {
+    _reservationsSub?.cancel();
+    super.dispose();
+  }
+
+  void _subscribeToSeatReservations() {
+    try {
+      final isoDate = widget.travelDate.toIso8601String().substring(0, 10);
+      final q = FirebaseFirestore.instance
+          .collection('seat_reservations')
+          .where('busId', isEqualTo: widget.bus.id)
+          .where('travelDate', isEqualTo: isoDate);
+
+      _reservationsSub = q.snapshots().listen((snap) {
+        final now = DateTime.now();
+        final booked = <int>{};
+        final reserved = <int>{};
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final seatNumRaw = data['seatNumber'];
+          final seatNum = seatNumRaw is int
+              ? seatNumRaw
+              : int.tryParse(seatNumRaw?.toString() ?? '0') ?? 0;
+          final status = (data['status'] ?? '').toString().toLowerCase();
+          if (status == 'booked') {
+            booked.add(seatNum);
+            continue;
+          }
+          if (status == 'reserved') {
+            final ts = data['reservedUntil'];
+            DateTime? until;
+            if (ts is Timestamp) {
+              until = ts.toDate();
+            } else if (ts is String) {
+              until = DateTime.tryParse(ts);
+            }
+            if (until != null && until.isAfter(now)) {
+              reserved.add(seatNum);
+            }
+          }
+        }
+        setState(() {
+          _bookedSeats
+            ..clear()
+            ..addAll(booked);
+          _reservedSeats
+            ..clear()
+            ..addAll(reserved);
+          // Deselect seats that just became unavailable
+          selectedSeats.removeWhere((s) => _bookedSeats.contains(s) || _reservedSeats.contains(s));
+        });
+      });
+    } catch (e) {
+      // ignore
+    }
   }
 
   Widget _buildSliverAppBar() {
@@ -297,25 +367,38 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
 
   Widget _buildSeatItem(int seatNum, {bool isVVIP = false}) {
     final isSelected = selectedSeats.contains(seatNum);
+    final isBooked = _bookedSeats.contains(seatNum);
+    final isReserved = _reservedSeats.contains(seatNum);
+
+    final bool isDisabled = isBooked || isReserved;
+
     return GestureDetector(
-      onTap: () => setState(() {
-        if (isSelected) {
-          selectedSeats.remove(seatNum);
-        } else {
-          selectedSeats.add(seatNum);
-        }
-      }),
+      onTap: isDisabled
+          ? null
+          : () => setState(() {
+                if (isSelected) {
+                  selectedSeats.remove(seatNum);
+                } else {
+                  selectedSeats.add(seatNum);
+                }
+              }),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 300),
         decoration: BoxDecoration(
-          color: isSelected
-              ? AppColors.primary
-              : (isVVIP ? const Color(0xFFFFD700).withAlpha(13) : Colors.white),
+          color: isBooked
+              ? Colors.grey.shade200
+              : (isSelected
+                  ? AppColors.primary
+                  : (isVVIP
+                      ? const Color(0xFFFFD700).withAlpha(13)
+                      : Colors.white)),
           borderRadius: BorderRadius.circular(15),
           border: Border.all(
-            color: isSelected
-                ? AppColors.primary
-                : (isVVIP ? const Color(0xFFFFD700) : Colors.black12),
+            color: isBooked
+                ? Colors.grey
+                : (isSelected
+                    ? AppColors.primary
+                    : (isVVIP ? const Color(0xFFFFD700) : Colors.black12)),
             width: isVVIP || isSelected ? 2 : 1,
           ),
           boxShadow: isSelected ? AppColors.premiumShadow : null,
@@ -327,25 +410,27 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Icon(
-                  isVVIP
-                      ? Icons.airline_seat_flat_rounded
-                      : Icons.chair_rounded,
-                  color: isSelected
-                      ? Colors.white
-                      : (isVVIP
-                          ? const Color(0xFFB8860B)
-                          : AppColors.textMuted.withAlpha(128)),
+                  isVVIP ? Icons.airline_seat_flat_rounded : Icons.chair_rounded,
+                  color: isBooked
+                      ? Colors.grey
+                      : (isSelected
+                          ? Colors.white
+                          : (isVVIP
+                              ? const Color(0xFFB8860B)
+                              : AppColors.textMuted.withAlpha(128))),
                   size: isVVIP ? 32 : 18,
                 ),
                 const SizedBox(height: 6),
                 Text(
                   isVVIP ? "V$seatNum" : seatNum.toString(),
                   style: TextStyle(
-                    color: isSelected
-                        ? Colors.white
-                        : (isVVIP
-                            ? const Color(0xFFB8860B)
-                            : AppColors.textPrimary),
+                    color: isBooked
+                        ? Colors.grey
+                        : (isSelected
+                            ? Colors.white
+                            : (isVVIP
+                                ? const Color(0xFFB8860B)
+                                : AppColors.textPrimary)),
                     fontWeight: FontWeight.w900,
                     fontSize: isVVIP ? 12 : 12,
                   ),
@@ -373,6 +458,30 @@ class _SeatSelectionPageState extends State<SeatSelectionPage> {
                 child: ZoomIn(
                   child: const Icon(Icons.check_circle_rounded,
                       color: Colors.white, size: 14),
+                ),
+              ),
+            if (isReserved && !isBooked)
+              Positioned(
+                bottom: 6,
+                child: Text(
+                  'RESERVED',
+                  style: TextStyle(
+                    color: Colors.orange.shade800,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            if (isBooked)
+              Positioned(
+                bottom: 6,
+                child: Text(
+                  'BOOKED',
+                  style: TextStyle(
+                    color: Colors.grey.shade700,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
               ),
           ],
