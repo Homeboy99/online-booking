@@ -725,6 +725,11 @@ app.get('/', (req, res) => {
 const RESERVATION_CLEANUP_INTERVAL_SECONDS = Number(process.env.RESERVATION_CLEANUP_INTERVAL_SECONDS || 60);
 const RESERVATION_CLEANUP_BATCH_SIZE = Number(process.env.RESERVATION_CLEANUP_BATCH_SIZE || 250);
 
+// Polling worker configuration
+const PAYMENT_POLL_INTERVAL_SECONDS = Number(process.env.PAYMENT_POLL_INTERVAL_SECONDS || 20);
+const PAYMENT_POLL_BATCH_SIZE = Number(process.env.PAYMENT_POLL_BATCH_SIZE || 100);
+const PAYMENT_POLL_CONCURRENCY = Number(process.env.PAYMENT_POLL_CONCURRENCY || 3);
+
 /**
  * Cleanup expired reserved seats by marking them cancelled.
  * Returns the number of reservations cleaned, or -1 on error.
@@ -780,6 +785,87 @@ setInterval(async () => {
     console.error('❌ Periodic cleanup failed:', err.message || err);
   }
 }, RESERVATION_CLEANUP_INTERVAL_SECONDS * 1000);
+
+/**
+ * Poll pending payments and reconcile their status with ZenoPay.
+ * This acts as a pseudo-webhook provider when actual webhook support is unavailable.
+ */
+async function pollPendingPayments() {
+  try {
+    const now = admin.firestore.Timestamp.now();
+    const q = db.collection('payments')
+      .where('status', '==', 'pending')
+      .limit(PAYMENT_POLL_BATCH_SIZE);
+
+    const snap = await q.get();
+    if (snap.empty) return 0;
+
+    let processed = 0;
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+
+      // Skip if pollAttempts already exhausted
+      const attempts = Number(data.pollAttempts || 0);
+      if (attempts >= PAYMENT_MAX_POLL_ATTEMPTS) {
+        // mark failed if not already
+        await doc.ref.update({ status: 'failed', failReason: 'poll_exhausted', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        try { await updateSeatReservationsForOrder(data.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after exhausted failed', e); }
+        processed++;
+        continue;
+      }
+
+      // If pollDeadline passed, mark failed
+      if (data.pollDeadline && data.pollDeadline.toDate && data.pollDeadline.toDate() < new Date()) {
+        await doc.ref.update({ status: 'failed', failReason: 'poll_timeout', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        try { await updateSeatReservationsForOrder(data.orderId, 'cancelled'); } catch (e) { console.error('❌ update seats after timeout failed', e); }
+        processed++;
+        continue;
+      }
+
+      // Respect a minimal backoff: if lastPolledAt is recent, skip this doc
+      if (data.lastPolledAt && data.lastPolledAt.toDate) {
+        const last = data.lastPolledAt.toDate();
+        const delta = (Date.now() - last.getTime()) / 1000;
+        if (delta < PAYMENT_POLL_INTERVAL_SECONDS / 2) {
+          continue; // skip recently-polled docs
+        }
+      }
+
+      // Perform the remote status check and reconciliation
+      await checkZenoPayStatusAndUpdate(doc);
+      processed++;
+
+      // Gentle throttling to avoid hammering remote gateway
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    if (processed > 0) console.log(`🕵️ Polling: processed ${processed} pending payments`);
+    return processed;
+  } catch (err) {
+    console.error('❌ pollPendingPayments error:', err.message || err);
+    return -1;
+  }
+}
+
+// Periodic polling loop
+setInterval(async () => {
+  try {
+    await pollPendingPayments();
+  } catch (err) {
+    console.error('❌ periodic polling failed:', err.message || err);
+  }
+}, PAYMENT_POLL_INTERVAL_SECONDS * 1000);
+
+// Manual trigger for admins/developers (authenticated)
+app.post('/api/_poll-pending-payments', authenticateAppUser, async (req, res) => {
+  try {
+    const count = await pollPendingPayments();
+    return res.status(200).json({ status: 'success', processed: count });
+  } catch (err) {
+    console.error('❌ manual poll trigger failed:', err.message || err);
+    return res.status(500).json({ status: 'error', message: 'poll failed' });
+  }
+});
 
 // Port Execution Configuration
 const PORT = process.env.PORT || 10000;
